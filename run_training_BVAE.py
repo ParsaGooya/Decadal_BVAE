@@ -581,7 +581,7 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
 
                             if all([ conditional_embedding is True,  params['condemb_to_decoder']]) :
                                 cond_embedded = net.embedding(cond.to(device))
-                                if all([params['condition_dependant_latent'], params['flow'] is None]):
+                                if all([params['condition_dependant_latent'], params['prior_flow'] is None]):
                                     cond_embedded = net.condition_mu(cond_embedded.flatten(start_dim=1))
                                 # cond_embedded = cond_embedded.unsqueeze(-2).expand(cond_embedded.shape[0], int(sample_size/cond_embedded.shape[0]), net.embedding_size)
                                 # cond_embedded = torch.flatten(cond_embedded, start_dim = 0, end_dim = 1)

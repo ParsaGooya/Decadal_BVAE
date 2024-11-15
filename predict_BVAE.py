@@ -702,7 +702,7 @@ if __name__ == "__main__":
     ### handles
     num_stds = 1
     params['non_random_decoder_initialization'] = False ## False,True, 'encoder_based_sampling', 'histogram_based_sampling'
-    params['BVAE'] = 500
+    params['BVAE'] = 100
     test_years = [2013,2014] #np.arange(2005,2015) #
     
 
