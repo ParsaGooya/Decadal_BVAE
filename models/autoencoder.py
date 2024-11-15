@@ -18,16 +18,26 @@ class Autoencoder(nn.Module):
 
     def __init__(self, input_dim, encoder_hidden_dims, decoder_hidden_dims=None, added_features_dim=0, append_mode=1, batch_normalization=False, dropout_rate=None, VAE = None, condition_embedding_dims = None, full_conditioning = False, condition_dependant_latent = False, fixed_posterior_variance = None, prior_flow:dict = None, condemb_to_decoder = False, device = 'cpu') -> None:
         super(Autoencoder, self).__init__()
-        if VAE is None:
+        if any([VAE is False, VAE is None]):
+            self.VAE = None
             assert condition_embedding_dims is None, 'condition_embedding_dims is for the cVAE model'
-        self.condition_embedding_dims = condition_embedding_dims 
+            assert full_conditioning is None, 'full_conditioning is for the cVAE model'
+            assert condition_dependant_latent is None, 'condition_dependant_latent is for the cVAE model'
+            assert fixed_posterior_variance is None , 'fixed_posterior_variance is for the cVAE model'
+            assert condemb_to_decoder is None, 'condemb_to_decoder is for the cVAE model'
+            assert prior_flow is None, 'prior_flow is for the cVAE model'
+        else:
+            self.VAE = VAE
+            latent_size = encoder_hidden_dims[-1]
+            self.condition_embedding_dims = condition_embedding_dims
+            self.full_conditioning = full_conditioning
+            self.condition_dependant_latent = condition_dependant_latent
+            self.fixed_posterior_variance = fixed_posterior_variance
+            self.condemb_to_decoder = condemb_to_decoder    
+         
         self.device = device
         self.append_mode = append_mode
-        self.full_conditioning = full_conditioning
-        self.condition_dependant_latent = condition_dependant_latent
-        self.fixed_posterior_variance = fixed_posterior_variance
-        self.condemb_to_decoder = condemb_to_decoder
-        latent_size = encoder_hidden_dims[-1]
+
         
         if prior_flow is not None:
             try: 
@@ -42,15 +52,11 @@ class Autoencoder(nn.Module):
 
         else:
             self.flow = None
+
         if fixed_posterior_variance is not None:
            if len(fixed_posterior_variance)>1:
             assert len(fixed_posterior_variance) == latent_size,'Provide one number or one number per latent dimension for the fixed posterior variance...'
            self.fixed_posterior_variance = torch.log(torch.from_numpy(fixed_posterior_variance)).expand(latent_size).to(device)
-
-        if VAE is False:
-            self.VAE = None
-        else:
-            self.VAE = VAE
 
 
         if decoder_hidden_dims is None:
@@ -62,7 +68,8 @@ class Autoencoder(nn.Module):
         if condition_embedding_dims is not None:
             embedding_size = condition_embedding_dims[-1]
             if condition_dependant_latent is True:
-                assert latent_size == embedding_size, 'For condition dependent latent the latent_size must equal embedding_size ...'
+                if self.flow is None:
+                    assert latent_size == embedding_size, 'For condition dependent latent the latent_size must equal embedding_size ...'
             if condemb_to_decoder:
                 latent_size = latent_size + embedding_size
             self.embedding_size = embedding_size
@@ -82,19 +89,27 @@ class Autoencoder(nn.Module):
                     layers.append(nn.Dropout(dropout_rate))
                 if batch_normalization:
                     layers.append(nn.BatchNorm1d(condition_embedding_dims[i + 1]))
+                    
             if condition_dependant_latent:
                 if self.flow is None:
                     self.condition_mu = nn.Linear(condition_embedding_dims[-2], embedding_size)
                     self.condition_log_var = nn.Linear(condition_embedding_dims[-2], embedding_size)
-                if any([condemb_to_decoder, self.flow is not None]):
-                    self.condition_embedding = nn.Linear(condition_embedding_dims[-2], embedding_size)
+                    # if condemb_to_decoder:
+                    #     self.condition_embedding = nn.Linear(condition_embedding_dims[-2], embedding_size)
+                else:
+                    layers.append(nn.Linear(condition_embedding_dims[-2], embedding_size))
+                    # layers.append(nn.ReLU())
+                    # if batch_normalization:
+                    #     layers.append(nn.BatchNorm1d(embedding_size))
             else:
                 layers.append(nn.Linear(condition_embedding_dims[-2], embedding_size))
+                # layers.append(nn.ReLU())
+                # if batch_normalization:
+                #     layers.append(nn.BatchNorm1d(embedding_size))
+
             if condemb_to_decoder:
                 latent_size = latent_size - embedding_size
-            # layers.append(nn.ReLU())
-            # if batch_normalization:
-            #     layers.append(nn.BatchNorm1d(embedding_size))
+
             self.embedding = nn.Sequential(*layers)
             
             if full_conditioning:
@@ -162,10 +177,10 @@ class Autoencoder(nn.Module):
                         self.condition_log_var.apply(weights_init)
                     else:
                         self.flow.apply(weights_init)
-                    try:
-                        self.condition_embedding.apply(weights_init)
-                    except:
-                        pass
+                    # try:
+                    #     self.condition_embedding.apply(weights_init)
+                    # except:
+                    #     pass
 
     def forward(self, x, condition = None, sample_size = 1, seed = None, nstd = 1):
         
@@ -186,14 +201,23 @@ class Autoencoder(nn.Module):
                 if self.flow is None:
                     cond_in_mu = self.condition_mu(cond_in)
                     cond_in_log_var =self.condition_log_var(cond_in)
-                if any([self.condemb_to_decoder, self.flow is not None]):
-                    cond_emb = self.condition_embedding(cond_in)
-                    cond_in = cond_emb.unsqueeze(-2).expand(cond_emb.shape[0], int(x_in.shape[0]/cond_emb.shape[0]), self.embedding_size)
+                    if  self.condemb_to_decoder:
+                        cond_emb = cond_in_mu
+                        cond_in = cond_emb.unsqueeze(-2).expand(cond_emb.shape[0], int(x_in.shape[0]/cond_emb.shape[0]), self.embedding_size)
+                        cond_in = torch.flatten(cond_in, start_dim = 0, end_dim = 1)
+                else:
+                    cond_emb = cond_in
+                    cond_in = cond_in.unsqueeze(-2).expand(cond_in.shape[0], int(x_in.shape[0]/cond_in.shape[0]), self.embedding_size)
                     cond_in = torch.flatten(cond_in, start_dim = 0, end_dim = 1)
+                # if any([self.condemb_to_decoder, self.flow is not None]):
+                    # cond_emb = self.condition_embedding(cond_in)
+                    # cond_in = cond_emb.unsqueeze(-2).expand(cond_emb.shape[0], int(x_in.shape[0]/cond_emb.shape[0]), self.embedding_size)
+                    # cond_in = torch.flatten(cond_in, start_dim = 0, end_dim = 1)
             else:
                 cond_in = cond_in.unsqueeze(-2).expand(cond_in.shape[0], int(x_in.shape[0]/cond_in.shape[0]), self.embedding_size)
                 cond_in = torch.flatten(cond_in, start_dim = 0, end_dim = 1)
-            if self.full_conditioning:
+
+            if self.full_conditioning: ## with condition dependent latent it is always on
                 full_cond = condition.expand(cond_in.shape[0], int(x_in.shape[0]/cond_in.shape[0]), x_in.shape[-1])
                 full_cond = torch.flatten(full_cond, start_dim = 0, end_dim = 1)
                 x_in = torch.cat([x_in, full_cond], dim=1)

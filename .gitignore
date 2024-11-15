@@ -167,3 +167,6 @@ gifs/
 data_utils/
 *BVAE2*
 data_gen.py
+models/AE_13Nov_2024.py
+models/unet2.py
+run_BVAE_13Nov*

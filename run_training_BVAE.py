@@ -52,10 +52,8 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
     if params['version'] == 1:
 
         params['forecast_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0)),
-        ('standardize', Standardizer(axis = (0,1,2)))]
-        params['observations_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0))  ]
+        ('standardize', Standardizer())]
+        params['observations_preprocessing_steps'] = []
 
     elif params['version'] == 2:
 
@@ -415,6 +413,11 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                     ds_train_conds = ds_train.stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()].mean('ensembles')
                 if lead_time is not None:
                     ds_train_conds = ds_train_conds.where((ds_train_conds.lead_time >=  (lead_time - 1) * 12 + 1) & (ds_train_conds.lead_time < (lead_time *12 )+1), drop = True)
+
+                condition_standardizer = Standardizer()
+                condition_standardizer.fit(ds_train_conds)
+                ds_train_conds = condition_standardizer.transform(ds_train_conds)
+
                 ds_train_conds = torch.from_numpy(ds_train_conds.to_numpy())
 
             # if reg_scale is None: ## PG: if no penalizing for negative anomalies
@@ -538,7 +541,8 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                                     cond = test_raw[0].mean(axis = -3) if (type(test_raw) == list) or (type(test_raw) == tuple) else test_raw.mean(axis = -3)         
                             else:
                                     cond = None
-
+                            
+                            cond = (cond - condition_standardizer.mean)/condition_standardizer.std
                             sample_size = test_raw[0].shape[0] if (type(test_raw) == list) or (type(test_raw) == tuple) else test_raw.shape[0]
                             if params['non_random_decoder_initialization'] is False:
                                 z =  Normal(torch.zeros(net.latent_size), torch.ones(( net.latent_size))).rsample(sample_shape=(params['BVAE']* sample_size,)).to(device)
@@ -563,8 +567,10 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                                     # z = torch.unflatten(z, dim = 0, sizes = shape[:2])
                                     if params['condition_dependant_latent']:
                                         cond_embedded = net.embedding(cond.to(device))
-                                        cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1))
+                                        # cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1))
                                         cond_embedded = cond_embedded.expand((z.shape[0], net.embedding_size))
+                                    else:
+                                        cond_embedded = None
                                     z,_ = net.flow.inverse(z, condition = cond_embedded)
                                     
                             # z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
@@ -572,10 +578,11 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                                 z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
                                 z = torch.cat([z, test_raw[1].unsqueeze(0).expand((params['BVAE'], *test_raw[1].shape))], dim=-1)
                                 z = torch.flatten(z, start_dim = 0, end_dim = 1)
+
                             if all([ conditional_embedding is True,  params['condemb_to_decoder']]) :
                                 cond_embedded = net.embedding(cond.to(device))
-                                if params['condition_dependant_latent']:
-                                    cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1))
+                                if all([params['condition_dependant_latent'], params['flow'] is None]):
+                                    cond_embedded = net.condition_mu(cond_embedded.flatten(start_dim=1))
                                 # cond_embedded = cond_embedded.unsqueeze(-2).expand(cond_embedded.shape[0], int(sample_size/cond_embedded.shape[0]), net.embedding_size)
                                 # cond_embedded = torch.flatten(cond_embedded, start_dim = 0, end_dim = 1)
                                 # cond_embedded = cond_embedded.unsqueeze(0).expand((z.shape[0], z.shape[1], net.embedding_size))
@@ -675,19 +682,19 @@ if __name__ == "__main__":
         "reg_scale" : 0,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.00001 ,
+        "lr": 0.0001 ,
         "loss_region": None,
         "subset_dimensions": None,
         "lead_time_mask" : None,
-        'lr_scheduler' : False,
+        'lr_scheduler' : True,
         'BVAE' : 10,
         'training_sample_size' : 1, 
         'non_random_decoder_initialization' : False,
-        'condition_embedding_size' : 'encoder',
-        'condemb_to_decoder' : False, 
-        'fixed_posterior_variance' : None ,#np.array([0.25]),
-        'condition_dependant_latent' : True,
-        'prior_flow' : {'type' : MAF, 'num_layers' : 5},
+        'condition_embedding_size' :[1500, 1500,1500,1500,1500,1500,1500, 1500,100],
+        'condemb_to_decoder' : True, 
+        'fixed_posterior_variance' : None,#np.array([0.25]),
+        'condition_dependant_latent' : False,
+        'prior_flow' : None,# {'type' : MAF, 'num_layers' : 5},
         'full_conditioning' : False,
         'cross_member_training' : False,
         'remove_ensemble_mean' : False,
@@ -698,7 +705,7 @@ if __name__ == "__main__":
     params['ensemble_list'] = np.arange(1,21)#[f'r{e}i1p2f1' for e in range(1,21,1)] ## PG
  
     params["arch"] = None
-    params['version'] = 0 ### 1 , 2 ,3
+    params['version'] = 1 ### 1 , 2 ,3
     params['beta'] =  dict(start = 0, end = 1, epochs = 100)  
     params['reg_scale'] = 0
     
@@ -768,14 +775,14 @@ if __name__ == "__main__":
             out_dir = out_dir + f'_fake_data_normal_2pi' 
         elif fake_data == 'pi':
             data_dir_forecast = LOC_FORECASTS_fgco2_pi
-            out_dir = out_dir + f'_fake_data_normal_pi' 
+            out_dir = out_dir + f'_fake_data_normal_pi_notencoder' 
         else:
             data_dir_forecast = LOC_FORECASTS_fgco2_simple
             out_dir = out_dir + f'_fake_data_normal_simple' 
         unit_change = 1
 
     if params['fixed_posterior_variance'] is not None:
-        out_dir = out_dir + f'_fxpvar'
+        out_dir = out_dir + f'_pR'
         
     out_dir = out_dir + f"_TSE{len(params['ensemble_list'])}" 
     Path(out_dir).mkdir(parents=True, exist_ok=True)

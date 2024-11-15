@@ -157,7 +157,7 @@ class WeightedMSESignLossKLD:  ## PG: penalizing negative anomalies
                 condition = None
             else:
                 condition = cond_mu
-                condition = condition.unsqueeze(0).expand_as(posterior_samples)
+                condition = condition.unsqueeze(0).expand(*posterior_samples.shape[0:-1], condition.shape[-1])
             
             e_samples, log_det = normalized_flow(torch.flatten(posterior_samples, start_dim= 0 , end_dim=1 ), condition =  torch.flatten(condition, start_dim= 0 , end_dim=1 ))
             e_samples = torch.unflatten(e_samples, dim = 0 , sizes = posterior_samples.shape[:2]).to(self.device)

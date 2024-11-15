@@ -10,7 +10,8 @@ from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.autoencoder import Autoencoder, Autoencoder_decoupled, Autoencoder_decoder
+# from models.AE_13Nov_2024 import Autoencoder, Autoencoder_decoupled, MAF  ## !!!!!!! for versions older than 11 Nov 2024 use thise line !!!!!!!!!! ##
+from models.autoencoder import Autoencoder, Autoencoder_decoupled, MAF  
 from models.unet import UNet
 from models.cnn import CNN, SCNN
 from losses import WeightedMSE, WeightedMSESignLoss, WeightedMSEKLD, WeightedMSESignLossKLD, VAEloss
@@ -40,8 +41,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
         params['remove_ensemble_mean'] = True 
     else:
         params['remove_ensemble_mean'] = False 
-
-
+     
     if 'MSESUM' in  results_dir:
         params['loss_reduction'] = 'sum'
     else:
@@ -52,16 +52,32 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
     else:
         lead_time = None
 
+    if 'fxpvar' not in  results_dir:
+        params['fixed_posterior_variance'] =  None
+    else:
+        params['fixed_posterior_variance'] =  np.array(params['fixed_posterior_variance'])
+
     if 'cEFullBVAE' in  results_dir:
         params['full_conditioning'] = True 
     else:
         params['full_conditioning'] = False 
+
+    if params['prior_flow'] is not None:
+        dics = {}
+        if len((params['prior_flow'].split('args'))) > 0:
+            pass
+        
+        dics['num_layers'] = eval((params['prior_flow'].split('num_layers'))[-1].split('}')[0].split(':')[-1])   
+        dics['type'] = eval(results_dir.split('prior')[0].split('_')[-1])
+        params['prior_flow'] = dics
 
     if 'latentdependant' in  results_dir:
         params['condition_dependant_latent'] = True
         assert params['condition_embedding_size'] is not None
         assert params['non_random_decoder_initialization'] != 'histogram_based_sampling'
         params['full_conditioning'] = True
+        if params['prior_flow'] is not None:
+            assert params['non_random_decoder_initialization'] is False, 'non_random_decoder_initialization should be False for condition dependant flow based prior ...'
     else: 
         params['condition_dependant_latent'] = False
 
@@ -92,10 +108,8 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
     if params['version'] == 1:
 
         params['forecast_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0)),
-        ('standardize', Standardizer(axis = (0,1,2)))]
-        params['observations_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0))  ]
+        ('standardize', Standardizer())]
+        params['observations_preprocessing_steps'] = []
 
     elif params['version'] == 2:
 
@@ -135,6 +149,8 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
     if params['condition_embedding_size'] == 'encoder':
         params['condition_embedding_size'] = params["hidden_dims"][0]
 
+
+
     if ensemble_list is not None: ## PG: calculate the mean if ensemble mean is none
         print("Load forecasts")
         ds_in = xr.open_dataset(data_dir_forecast).sel(ensembles = ensemble_list).load()['fgco2']
@@ -152,7 +168,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
     obs_in = ds_in.mean('ensembles')[:,:12].rename({'lead_time' : 'month'})
 
     obs_in = obs_in.expand_dims('channels', axis=2)
-
+    
     if 'ensembles' in ds_in.dims: ### PG: add channels dimention to the correct axis based on whether we have ensembles or not
         ds_in = ds_in.expand_dims('channels', axis=3).sortby('ensembles')
     else:
@@ -196,7 +212,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
            extra_predictors = None     
 
     if extra_predictors is not None:
-        if params["model"] in [Autoencoder_decoupled, Autoencoder]:
+        if params["model"] in [ Autoencoder]:
             weights = np.cos(np.ones_like(extra_predictors.lon) * (np.deg2rad(extra_predictors.lat.to_numpy()))[..., None])  # Moved this up
             weights = xr.DataArray(weights, dims = extra_predictors.dims[-2:], name = 'weights').assign_coords({'lat': extra_predictors.lat, 'lon' : extra_predictors.lon}) 
             extra_predictors = (extra_predictors * weights).sum(['lat','lon'])/weights.sum(['lat','lon'])
@@ -371,7 +387,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
 
         if model == Autoencoder:
             net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate, VAE = params['BVAE'], condition_embedding_dims = params['condition_embedding_size'], full_conditioning = params["full_conditioning"], 
-                        condition_dependant_latent = params["condition_dependant_latent"], condemb_to_decoder = params['condemb_to_decoder'], device = device)
+                        condition_dependant_latent = params["condition_dependant_latent"], fixed_posterior_variance = params['fixed_posterior_variance'], prior_flow = params['prior_flow'], condemb_to_decoder = params['condemb_to_decoder'], device = device)
         elif model == Autoencoder_decoupled:
             net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate)
 
@@ -391,6 +407,9 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
                 ds_train_conds = ds_train.stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()].mean('ensembles')
             if lead_time is not None:
                 ds_train_conds = ds_train_conds.where((ds_train_conds.lead_time >=  (lead_time - 1) * 12 + 1) & (ds_train_conds.lead_time < (lead_time *12 )+1), drop = True)
+            condition_standardizer = Standardizer()
+            condition_standardizer.fit(ds_train_conds)
+            ds_train_conds = condition_standardizer.transform(ds_train_conds)
             ds_train_conds = torch.from_numpy(ds_train_conds.to_numpy())
 
         # if reg_scale is None: ## PG: if no penalizing for negative anomalies
@@ -512,12 +531,13 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
                     else:
                             cond = None
 
+                    cond = (cond - condition_standardizer.mean)/condition_standardizer.std
                     sample_size = test_raw[0].shape[0] if (type(test_raw) == list) or (type(test_raw) == tuple) else test_raw.shape[0]
-                    if not params['non_random_decoder_initialization']:
+                    if params['non_random_decoder_initialization'] is False:
                         z =  Normal(torch.zeros(net.latent_size), torch.ones(( net.latent_size))).rsample(sample_shape=(params['BVAE']* sample_size,)).to(device)
 
                     else:
-                        if all([params['condition_dependant_latent'], params['non_random_decoder_initialization']]):
+                        if params['condition_dependant_latent']:
                                 _, _, _, cond_mu, cond_log_var = net(test_raw, condition = cond, sample_size = 1)
                                 cond_var = torch.exp(cond_log_var) + 1e-4
                                 z =  Normal(cond_mu, torch.sqrt(cond_var)).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
@@ -539,19 +559,28 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
                             # z = torch.unflatten(z, dim = 0, sizes = shape[:2])
                             if params['condition_dependant_latent']:
                                 cond_embedded = net.embedding(cond.to(device))
-                                cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1))
+                                try:
+                                    cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1)) ## for versions older than 11 Nov 2024 use thise line!
+                                except:
+                                    pass
                                 cond_embedded = cond_embedded.expand((z.shape[0], net.embedding_size))
-                            z,_ = net.flow(z, condition = cond_embedded)
+                            else:
+                                cond_embedded = None
+                            z,_ = net.flow.inverse(z, condition = cond_embedded)
                             
                     if all([params['time_features'] is not None, params['append_mode'] != 1]):
                         z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
                         z = torch.cat([z, test_raw[1].unsqueeze(0).expand((params['BVAE'], *test_raw[1].shape))], dim=-1)
                         z = torch.flatten(z, start_dim = 0, end_dim = 1)
 
-                    if all([conditional_embedding,  params['condemb_to_decoder']]):
+                    if all([conditional_embedding is True,  params['condemb_to_decoder']]):
                         cond_embedded = net.embedding(cond.to(device))
-                        if params['condition_dependant_latent']:
-                            cond_embedded = net.condition_embedding(cond_embedded) 
+                        if all([params['condition_dependant_latent'], params['flow'] is None]):
+                            cond_embedded = net.condition_mu(cond_embedded.flatten(start_dim=1))
+                            try:
+                                cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1)) ## for versions older than 11 Nov 2024 use thise line!
+                            except:
+                                pass
                         # cond_embedded = cond_embedded.unsqueeze(-2).expand(cond_embedded.shape[0], int(sample_size/cond_embedded.shape[0]), net.embedding_size)
                         # cond_embedded = torch.flatten(cond_embedded, start_dim = 0, end_dim = 1)
                         # cond_embedded = cond_embedded.unsqueeze(0).expand((z.shape[0], z.shape[1], net.embedding_size))
@@ -652,7 +681,7 @@ if __name__ == "__main__":
 
     fake_data = 'pi'
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/fgco2_ems/SOM-FFN/results/Autoencoder/run_set_8_toy'
-    out_dir    = f'{out_dir_x}/N2_v0_B0.5_L0_archNone_batch100_e100_lr_scheduler_cBVAElatentdependant_10-1_hist_fake_data_normal_pi_largerbeta_TSE20' 
+    out_dir    = f'{out_dir_x}/N2_v1_Banealing_L0_archNone_batch100_e100_lr_scheduler_cBVAElatentdependant_cR_10-1_MAFprior_hist_fake_data_normal_pi_TSE20' 
 
     lead_years = int(len(xr.open_mfdataset(str(Path(out_dir , "*.nc")), combine='nested', concat_dim='year').lead_time)/12)
 
@@ -672,8 +701,8 @@ if __name__ == "__main__":
 
     ### handles
     num_stds = 1
-    params['non_random_decoder_initialization'] = 'encoder_based_sampling' ## False,True, 'encoder_based_sampling', 'histogram_based_sampling'
-    params['BVAE'] = 50
+    params['non_random_decoder_initialization'] = False ## False,True, 'encoder_based_sampling', 'histogram_based_sampling'
+    params['BVAE'] = 500
     test_years = [2013,2014] #np.arange(2005,2015) #
     
 
