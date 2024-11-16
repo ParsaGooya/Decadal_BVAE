@@ -10,7 +10,7 @@ from torch.distributions import Normal
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.autoencoder import Autoencoder, MAF
+from models.autoencoder import Autoencoder, MAF, RealNVP
 from models.cnn import CNN
 from models.unet import UNet
 from losses import WeightedMSE, WeightedMSESignLoss, WeightedMSESignLossKLD
@@ -690,11 +690,11 @@ if __name__ == "__main__":
         'BVAE' : 10,
         'training_sample_size' : 1, 
         'non_random_decoder_initialization' : False,
-        'condition_embedding_size' :[1500, 1500,1500,1500,1500,1500,1500, 1500,100],
+        'condition_embedding_size' :[1500, 1500,1500,1500,1500,1500,1500, 1500,2],
         'condemb_to_decoder' : True, 
         'fixed_posterior_variance' : None,#np.array([0.25]),
         'condition_dependant_latent' : False,
-        'prior_flow' : None,# {'type' : MAF, 'num_layers' : 5},
+        'prior_flow' :  None,#{'type' : RealNVP, 'num_layers' : 5},
         'full_conditioning' : False,
         'cross_member_training' : False,
         'remove_ensemble_mean' : False,
@@ -706,7 +706,7 @@ if __name__ == "__main__":
  
     params["arch"] = None
     params['version'] = 1 ### 1 , 2 ,3
-    params['beta'] =  dict(start = 0, end = 1, epochs = 100)  
+    params['beta'] = 1# dict(start = 0, end = 1, epochs = 100)  
     params['reg_scale'] = 0
     
     biomes = xr.open_dataset('/home/rpg002/fgco2_decadal_forecast_adjustment/Time_Varying_Biomes.nc').MeanBiomes.transpose()

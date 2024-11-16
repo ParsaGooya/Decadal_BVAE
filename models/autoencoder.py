@@ -720,7 +720,72 @@ class MAF(nn.Module):
             # print(alpha)
             log_det += alpha # torch.clamp(-1*alpha, max=10)
         return x, log_det
-    
+
+
+class RealNVP(nn.Module):
+    """
+    Non-volume preserving flow.
+
+    [Dinh et. al. 2017]
+    """
+    def __init__(self, dim, hidden_dim = 16, condition_embedding_size = None, base_network=FCNN,  device = 'cpu'):
+        super().__init__()
+        self.dim = dim
+        added_features = condition_embedding_size if condition_embedding_size is not None else 0
+        self.t1 = base_network(added_features + dim // 2, dim // 2, hidden_dim)
+        self.s1 = base_network(added_features + dim // 2, dim // 2, hidden_dim)
+        self.t2 = base_network(added_features + dim // 2, dim // 2, hidden_dim)
+        self.s2 = base_network(added_features + dim // 2, dim // 2, hidden_dim)
+
+    def forward(self, x, condition = None ):
+        lower, upper = x[:,:self.dim // 2].clone(), x[:,self.dim // 2:].clone()
+        if condition is not None:
+            t1_transformed = self.t1(torch.cat([lower, condition], dim = -1))
+            s1_transformed = self.s1(torch.cat([lower, condition], dim = -1))
+        else:
+            t1_transformed = self.t1(lower)
+            s1_transformed = self.s1(lower)
+        upper = t1_transformed + upper * torch.exp(s1_transformed)
+        if condition is not None:
+            t2_transformed = self.t2(torch.cat([upper, condition], dim = -1))
+            s2_transformed = self.s2(torch.cat([upper, condition], dim = -1))
+        else:
+            t2_transformed = self.t2(upper)
+            s2_transformed = self.s2(upper)
+
+        lower = t2_transformed + lower * torch.exp(s2_transformed)
+        z = torch.cat([lower, upper], dim=1)
+        log_det = torch.sum(s1_transformed, dim=1) + \
+                  torch.sum(s2_transformed, dim=1)
+        return z, log_det
+
+    def inverse(self, z, condition = None):
+        lower, upper = z[:,:self.dim // 2].clone(), z[:,self.dim // 2:].clone()
+        if condition is not None:
+            t2_transformed = self.t2(torch.cat([upper, condition], dim = -1))
+            s2_transformed = self.s2(torch.cat([upper, condition], dim = -1))
+        else:
+            t2_transformed = self.t2(upper)
+            s2_transformed = self.s2(upper)
+
+        lower = (lower - t2_transformed) * torch.exp(-s2_transformed)
+
+        if condition is not None:
+            t1_transformed = self.t1(torch.cat([lower, condition], dim = -1))
+            s1_transformed = self.s1(torch.cat([lower, condition], dim = -1))
+        else:
+            t1_transformed = self.t1(lower)
+            s1_transformed = self.s1(lower)
+            
+        upper = (upper - t1_transformed) * torch.exp(-s1_transformed)
+        x = torch.cat([lower, upper], dim=1)
+        log_det = torch.sum(-s1_transformed, dim=1) + \
+                  torch.sum(-s2_transformed, dim=1)
+        return x, log_det
+
+
+
+
 class NormalizingFlowModel(nn.Module):
 
     def __init__(self, flows, device = 'cpu'):

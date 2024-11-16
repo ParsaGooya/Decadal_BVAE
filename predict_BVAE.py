@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
 # from models.AE_13Nov_2024 import Autoencoder, Autoencoder_decoupled, MAF  ## !!!!!!! for versions older than 11 Nov 2024 use thise line !!!!!!!!!! ##
-from models.autoencoder import Autoencoder, Autoencoder_decoupled, MAF  
+from models.autoencoder import Autoencoder, Autoencoder_decoupled, MAF , RealNVP 
 from models.unet import UNet
 from models.cnn import CNN, SCNN
 from losses import WeightedMSE, WeightedMSESignLoss, WeightedMSEKLD, WeightedMSESignLossKLD, VAEloss
@@ -52,7 +52,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
     else:
         lead_time = None
 
-    if 'fxpvar' not in  results_dir:
+    if 'pR' not in  results_dir:
         params['fixed_posterior_variance'] =  None
     else:
         params['fixed_posterior_variance'] =  np.array(params['fixed_posterior_variance'])
