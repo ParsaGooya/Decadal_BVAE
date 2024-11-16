@@ -631,7 +631,9 @@ class Autoencoder_decoder(nn.Module):
 
 
 
-
+########################################################################################################################################################
+#    Code below sourced from https://github.com/tonyduan/normalizing-flows/tree/master?tab=readme-ov-file with adjustments to make the flows conditional.
+########################################################################################################################################################
 
 
 class FCNN(nn.Module):
@@ -776,7 +778,7 @@ class RealNVP(nn.Module):
         else:
             t1_transformed = self.t1(lower)
             s1_transformed = self.s1(lower)
-            
+
         upper = (upper - t1_transformed) * torch.exp(-s1_transformed)
         x = torch.cat([lower, upper], dim=1)
         log_det = torch.sum(-s1_transformed, dim=1) + \

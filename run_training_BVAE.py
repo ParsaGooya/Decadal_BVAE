@@ -690,7 +690,7 @@ if __name__ == "__main__":
         'BVAE' : 10,
         'training_sample_size' : 1, 
         'non_random_decoder_initialization' : False,
-        'condition_embedding_size' :[1500, 1500,1500,1500,1500,1500,1500, 1500,2],
+        'condition_embedding_size' :[1500, 1500,1500,1500,1500,1500,1500, 1500,100],
         'condemb_to_decoder' : True, 
         'fixed_posterior_variance' : None,#np.array([0.25]),
         'condition_dependant_latent' : False,
@@ -706,7 +706,7 @@ if __name__ == "__main__":
  
     params["arch"] = None
     params['version'] = 1 ### 1 , 2 ,3
-    params['beta'] = 1# dict(start = 0, end = 1, epochs = 100)  
+    params['beta'] = 0.5# dict(start = 0, end = 1, epochs = 100)  
     params['reg_scale'] = 0
     
     biomes = xr.open_dataset('/home/rpg002/fgco2_decadal_forecast_adjustment/Time_Varying_Biomes.nc').MeanBiomes.transpose()
