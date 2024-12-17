@@ -6,8 +6,8 @@
 #PBS -o BashHelloJob.out
 #PBS -e BashHelloJob.err
 
-working_dir=/home/rpg002/fgco2_decadal_forecast_adjustment_BVAE_historical/
+working_dir=/home/rpg002/Decadal_BVAE/
 source .condainit  
 conda activate rsaenv_neurips  
 cd ${working_dir}
-python run_training_BVAE.py  >> /home/rpg002/fgco2_decadal_forecast_adjustment_BVAE_historical/output.txt
+python run_training_BVAE.py  >> /home/rpg002/Decadal_BVAE/output.txt

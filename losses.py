@@ -105,10 +105,10 @@ class WeightedMSEKLD:  ## PG: penalizing negative anomalies
             KL = kl_divergence(
                             Normal(mu,  torch.sqrt(var)),
                             Normal(cond_mu, torch.sqrt(cond_var)))
-        # if self.reduction == 'mean':
-        #     KL = KL.mean()
-        # if self.reduction == 'sum':
-        KL = KL.sum(dim=-1).mean()
+        if self.reduction == 'mean':
+            KL = KL.mean()
+        if self.reduction == 'sum':
+            KL = KL.sum(dim=-1).mean()
         # KL =  ( 0.5 * (var + mu**2 - torch.log(var) - 1)).sum(dim=1).mean()
         loss += KL* beta #/(KL.max() - KL.min())
         if print_loss: 
@@ -142,14 +142,18 @@ class WeightedMSESignLossKLD:  ## PG: penalizing negative anomalies
                 KL = kl_divergence(
                                 Normal(mu,  torch.sqrt(var)),
                                 Normal(cond_mu, torch.sqrt(cond_var)))
-            KL = KL.sum(dim=-1).mean()
+            if self.reduction == 'sum':
+                KL = KL.sum(dim=-1).mean()
+            if self.reduction == 'mean':
+                KL = KL.mean()
+
         else:
+            assert self.reduction == 'sum', 'reduction needs to be sum for prior flow to calculate KL term ...'
             # if all([cond_mu is None, cond_log_var is None]):
             base_dist = Normal(torch.zeros_like(mu), torch.ones_like(log_var))
             # else:
                 # cond_var = (torch.exp(cond_log_var) + 1e-4)
                 # base_dist = Normal(cond_mu, torch.sqrt(cond_var))
-
             posterior_samples = sample(mu,  torch.sqrt(var), sample_size = 5000, device=self.device)
             posterior_logprob = Normal(mu,  torch.sqrt(var)).log_prob(posterior_samples).mean(0).sum(-1).to(self.device)
 
@@ -158,12 +162,16 @@ class WeightedMSESignLossKLD:  ## PG: penalizing negative anomalies
             else:
                 condition = cond_mu
                 condition = condition.unsqueeze(0).expand(*posterior_samples.shape[0:-1], condition.shape[-1])
+                condition = torch.flatten(condition, start_dim= 0 , end_dim=1 )
             
-            e_samples, log_det = normalized_flow(torch.flatten(posterior_samples, start_dim= 0 , end_dim=1 ), condition =  torch.flatten(condition, start_dim= 0 , end_dim=1 ))
+            e_samples, log_det = normalized_flow(torch.flatten(posterior_samples, start_dim= 0 , end_dim=1 ), condition =  condition)
             e_samples = torch.unflatten(e_samples, dim = 0 , sizes = posterior_samples.shape[:2]).to(self.device)
+
             prior_logprob = base_dist.log_prob(e_samples).mean(0).sum(-1).to(self.device)
+
             log_det = torch.unflatten(log_det, dim = 0 , sizes = posterior_samples.shape[:2]).mean(0).to(self.device)
             KL = ( posterior_logprob - prior_logprob - log_det).mean()
+            KL = KL.clamp(0)
 
         # KL =  ( 0.5 * (var + mu**2 - torch.log(var) - 1)).sum(dim=1).mean()
         # if self.reduction == 'mean':

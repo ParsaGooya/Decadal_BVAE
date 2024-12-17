@@ -16,14 +16,14 @@ import torch.distributions as dist
 
 class Autoencoder(nn.Module):
 
-    def __init__(self, input_dim, encoder_hidden_dims, decoder_hidden_dims=None, added_features_dim=0, append_mode=1, batch_normalization=False, dropout_rate=None, VAE = None, condition_embedding_dims = None, full_conditioning = False, condition_dependant_latent = False, fixed_posterior_variance = None, prior_flow:dict = None, condemb_to_decoder = False, device = 'cpu') -> None:
+    def __init__(self, input_dim, encoder_hidden_dims, decoder_hidden_dims=None, added_features_dim=0, append_mode=1, batch_normalization=False, dropout_rate=None, VAE = None, condition_embedding_dims = None, full_conditioning = False, condition_dependant_latent = False, min_posterior_variance = None, prior_flow:dict = None, condemb_to_decoder = False, device = 'cpu') -> None:
         super(Autoencoder, self).__init__()
         if any([VAE is False, VAE is None]):
             self.VAE = None
             assert condition_embedding_dims is None, 'condition_embedding_dims is for the cVAE model'
             assert full_conditioning is None, 'full_conditioning is for the cVAE model'
             assert condition_dependant_latent is None, 'condition_dependant_latent is for the cVAE model'
-            assert fixed_posterior_variance is None , 'fixed_posterior_variance is for the cVAE model'
+            assert min_posterior_variance is None , 'min_posterior_variance is for the cVAE model'
             assert condemb_to_decoder is None, 'condemb_to_decoder is for the cVAE model'
             assert prior_flow is None, 'prior_flow is for the cVAE model'
         else:
@@ -32,7 +32,7 @@ class Autoencoder(nn.Module):
             self.condition_embedding_dims = condition_embedding_dims
             self.full_conditioning = full_conditioning
             self.condition_dependant_latent = condition_dependant_latent
-            self.fixed_posterior_variance = fixed_posterior_variance
+            self.min_posterior_variance = min_posterior_variance
             self.condemb_to_decoder = condemb_to_decoder    
          
         self.device = device
@@ -53,10 +53,12 @@ class Autoencoder(nn.Module):
         else:
             self.flow = None
 
-        if fixed_posterior_variance is not None:
-           if len(fixed_posterior_variance)>1:
-            assert len(fixed_posterior_variance) == latent_size,'Provide one number or one number per latent dimension for the fixed posterior variance...'
-           self.fixed_posterior_variance = torch.log(torch.from_numpy(fixed_posterior_variance)).expand(latent_size).to(device)
+        if min_posterior_variance is not None:
+           if len(min_posterior_variance)>1:
+            assert len(min_posterior_variance) == latent_size,'Provide one number or one number per latent dimension for the fixed posterior variance...'
+           self.min_posterior_variance = torch.log(torch.from_numpy(min_posterior_variance)).expand(latent_size).to(device)
+        else:
+            self.min_posterior_variance = torch.from_numpy(np.array(-np.inf)).expand(latent_size).to(device)
 
 
         if decoder_hidden_dims is None:
@@ -142,8 +144,7 @@ class Autoencoder(nn.Module):
 
         if self.VAE is not None:
             self.mu = nn.Linear(encoder_dims[-1], latent_size)
-            if self.fixed_posterior_variance is None:
-                self.log_var = nn.Linear(encoder_dims[-1], latent_size)
+            self.log_var = nn.Linear(encoder_dims[-1], latent_size)
             self.N = torch.distributions.Normal(0, 1)
             # Get sampling working on GPU
             if device.type == 'cuda':
@@ -167,8 +168,7 @@ class Autoencoder(nn.Module):
             self.encoder.apply(weights_init)
             self.decoder.apply(weights_init)
             self.mu.apply(weights_init)
-            if self.fixed_posterior_variance is None:
-                self.log_var.apply(weights_init)
+            self.log_var.apply(weights_init)
             if condition_embedding_dims is not None:
                 self.embedding.apply(weights_init)
                 if condition_dependant_latent:
@@ -206,9 +206,10 @@ class Autoencoder(nn.Module):
                         cond_in = cond_emb.unsqueeze(-2).expand(cond_emb.shape[0], int(x_in.shape[0]/cond_emb.shape[0]), self.embedding_size)
                         cond_in = torch.flatten(cond_in, start_dim = 0, end_dim = 1)
                 else:
-                    cond_emb = cond_in
-                    cond_in = cond_in.unsqueeze(-2).expand(cond_in.shape[0], int(x_in.shape[0]/cond_in.shape[0]), self.embedding_size)
-                    cond_in = torch.flatten(cond_in, start_dim = 0, end_dim = 1)
+
+                    cond_emb = cond_in.unsqueeze(-2).expand(cond_in.shape[0], int(x_in.shape[0]/cond_in.shape[0]), self.embedding_size)
+                    cond_emb = torch.flatten(cond_emb, start_dim = 0, end_dim = 1)
+                    cond_in = cond_emb
                 # if any([self.condemb_to_decoder, self.flow is not None]):
                     # cond_emb = self.condition_embedding(cond_in)
                     # cond_in = cond_emb.unsqueeze(-2).expand(cond_emb.shape[0], int(x_in.shape[0]/cond_emb.shape[0]), self.embedding_size)
@@ -233,7 +234,7 @@ class Autoencoder(nn.Module):
                 out = self.encoder(torch.cat([x_in, x[1]], dim=1))
                 if self.VAE is not None:
                     mu = self.mu(out)
-                    log_var =self.log_var(out) if self.fixed_posterior_variance is None else self.fixed_posterior_variance.unsqueeze(0).expand_as(mu).type_as(mu)
+                    log_var = torch.clamp(self.log_var(out), min = self.min_posterior_variance.type_as(mu), max = None)
                     out = self.sample( mu, log_var, sample_size, seed, nstd = nstd)
                     out_shape = out.shape
                     if all([self.condition_embedding_dims is not None, self.condemb_to_decoder]):
@@ -250,7 +251,7 @@ class Autoencoder(nn.Module):
                 out = self.encoder(x_in)
                 if self.VAE is not None:
                     mu = self.mu(out)
-                    log_var = self.log_var(out) if self.fixed_posterior_variance is None else self.fixed_posterior_variance.unsqueeze(0).expand_as(mu).type_as(mu)
+                    log_var = torch.clamp(self.log_var(out), min = self.min_posterior_variance.type_as(mu), max = None)
                     out = self.sample(mu, log_var, sample_size, seed, nstd = nstd)
                     out = torch.cat([out, x[1].unsqueeze(0).expand((sample_size, *x[1].shape))], dim=2)
                     out_shape = out.shape
@@ -268,7 +269,7 @@ class Autoencoder(nn.Module):
                 out = self.encoder(torch.cat([x_in, x[1]], dim=1))
                 if self.VAE is not None:
                     mu = self.mu(out)
-                    log_var = self.log_var(out) if self.fixed_posterior_variance is None else self.fixed_posterior_variance.unsqueeze(0).expand_as(mu).type_as(mu)
+                    log_var = torch.clamp(self.log_var(out), min = self.min_posterior_variance.type_as(mu), max = None)
                     out = self.sample(mu, log_var, sample_size, seed, nstd = nstd)
                     out = torch.cat([out, x[1].unsqueeze(0).expand((sample_size, *x[1].shape))], dim=2)
                     out_shape = out.shape
@@ -288,7 +289,7 @@ class Autoencoder(nn.Module):
 
             if self.VAE is not None:
                     mu = self.mu(out)
-                    log_var = self.log_var(out) if self.fixed_posterior_variance is None else self.fixed_posterior_variance.unsqueeze(0).expand_as(mu).type_as(mu)
+                    log_var = torch.clamp(self.log_var(out), min = self.min_posterior_variance.type_as(mu), max = None)
                     out = self.sample(mu, log_var, sample_size, seed, nstd = nstd)
                     out_shape = out.shape
                     if all([self.condition_embedding_dims is not None, self.condemb_to_decoder]):
@@ -659,7 +660,7 @@ class MAF(nn.Module):
 
     [Papamakarios et al. 2018]
     """
-    def __init__(self, dim, hidden_dim = 16, base_network=FCNN, condition_embedding_size = None,  device = 'cpu'):
+    def __init__(self, dim, hidden_dim = 16, base_network=FCNN, condition_embedding_size = None, base_distribution = None, device = 'cpu'):
         super().__init__()
         self.device = device
         self.dim = dim
@@ -730,7 +731,7 @@ class RealNVP(nn.Module):
 
     [Dinh et. al. 2017]
     """
-    def __init__(self, dim, hidden_dim = 16, condition_embedding_size = None, base_network=FCNN,  device = 'cpu'):
+    def __init__(self, dim, hidden_dim = 16, condition_embedding_size = None, base_network=FCNN, base_distribution = None, device = 'cpu'):
         super().__init__()
         self.dim = dim
         added_features = condition_embedding_size if condition_embedding_size is not None else 0

@@ -49,13 +49,12 @@ def get_coordinate_indices(data, area):
 
 
 def align_data_and_targets(data, targets, lead_years):
-    if 'ensembles' in data.dims: 
-        if lead_years*12 > data.shape[2]:
-            raise ValueError(f'Maximum available lead years: {int(data.shape[2] / 12)}')
-    else:
-        if lead_years*12 > data.shape[1]:
-            raise ValueError(f'Maximum available lead years: {int(data.shape[1] / 12)}')
-        
+    
+
+    lead_time_dim = data.get_axis_num('lead_time')
+    if lead_years*12 > data.shape[2]:
+            raise ValueError(f'Maximum available lead years: {int(data.shape[lead_time_dim] / 12)}')
+
     last_target_year = data.year[-1].item() + lead_years - 1
     last_years_diff = data.year[-1].item() - targets.year[-1].item()
     year_diff = targets.year[-1].item() - last_target_year
@@ -521,14 +520,41 @@ class Standardizer:
         return self
 
     def transform(self, data):
-        data_standardized = (data - self.mean) / self.std
+        if self.axis is not None:
+            if type(data) == np.ndarray:
+                self.transpose = (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))
+                self.transpose_back = self.transpose
+            else:
+                self.transpose = tuple([data.dims[i] for i in (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))])
+                self.transpose_back = data.dims
+        else:
+            if type(data) == np.ndarray:
+                self.transpose =  tuple(np.arange(len(data.shape)))
+                self.transpose_back = self.transpose
+            else:
+                self.transpose = data.dims
+                self.transpose_back =  data.dims
+
+        data_transposed = data.transpose(*self.transpose)
+        data_standardized = (data_transposed - self.mean) / self.std
+
         if self.axis is None:
-            data_standardized = data_standardized.where(~np.isnan(self.mean)  & (self.std != 0) , 0).where(~np.isnan(self.mean)) 
+            if type(data) == np.ndarray:
+                data_standardized[np.isinf(data_standardized)] = 0
+            else:
+                # data_standardized = data_standardized.where(~np.isnan(self.mean)  & (self.std != 0) , 0).where(~np.isnan(self.mean)) 
+                data_standardized = data_standardized.where(~np.isinf(data_standardized) , 0)
+        data_standardized = data_standardized.transpose(*self.transpose_back)
+            
         return data_standardized
 
-    def inverse_transform(self, data):
-        data_raw = data * self.std + self.mean
-        return data_raw
+    def inverse_transform(self, data: np.ndarray):
+
+        transpose_ =  (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))
+        data_transposed = data.transpose(*transpose_)
+        data_raw = data_transposed * self.std + self.mean
+
+        return data_raw.transpose(*transpose_)
 
 
 class Normalizer:

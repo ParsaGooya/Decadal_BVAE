@@ -12,13 +12,13 @@ import torch
 from torch.distributions import Normal
 from torch.utils.data import DataLoader
 from torch.optim import lr_scheduler
-from models.autoencoder import Autoencoder, Autoencoder_decoupled, Autoencoder_decoder
+from models.autoencoder import Autoencoder, MAF, RealNVP
 from models.unet import UNet
 from models.cnn import CNN
-from losses import WeightedMSE,WeightedMSESignLoss, GlobalLoss, WeightedMSEKLD, WeightedMSESignLossKLD, VAEloss
+from losses import WeightedMSE, WeightedMSESignLoss, WeightedMSESignLossKLD
 from data_utils.datahandling import combine_observations
 from preprocessing import align_data_and_targets, get_coordinate_indices, create_train_mask, reshape_obs_to_data, config_grid
-from preprocessing import AnomaliesScaler_v1, AnomaliesScaler_v2, Detrender, Standardizer, Normalizer, PreprocessingPipeline, Spatialnanremove
+from preprocessing import AnomaliesScaler_v1, AnomaliesScaler_v2, Standardizer, PreprocessingPipeline, Spatialnanremove
 from torch_datasets import XArrayDataset
 from subregions import subregions
 from data_locations import LOC_FORECASTS_fgco2_2pi, LOC_FORECASTS_fgco2_pi, LOC_OBSERVATIONS_fgco2_v2023, LOC_FORECASTS_fgco2_simple, LOC_FORECASTS_fgco2
@@ -26,7 +26,7 @@ import gc
 # specify data directories
 data_dir_forecast = LOC_FORECASTS_fgco2
 data_dir_obs = LOC_OBSERVATIONS_fgco2_v2023
-unit_change = 60*60*24*365 * 1000 /12 * -1 ## Change units for ESM data to mol m-2 yr-1
+unit_change = 60*60*24*365 * 1000 /12 * -1  ## Change units for ESM data to mol m-2 yr-1
 
 
 def HP_congif(params, data_dir_obs, lead_years):
@@ -55,15 +55,12 @@ def HP_congif(params, data_dir_obs, lead_years):
     else:    ## Load specified members
         print("Load forecasts") 
         ds_in = xr.open_dataset(data_dir_forecast).mean('ensembles').load()['fgco2']
-    
+
     print("Load observations")
-    if params['correction']:
-        obs_in = combine_observations(data_dir_obs, two_dim=True) # 1961.01 - 2021.12
-    else:
-        obs_in = ds_in.mean('ensembles')[:,:12].rename({'lead_time' : 'month'})
 
+    obs_in = ds_in.mean('ensembles')[:,:12].rename({'lead_time' : 'month'})
     obs_in = obs_in.expand_dims('channels', axis=2)
-
+    
     if 'ensembles' in ds_in.dims: ### PG: add channels dimention to the correct axis based on whether we have ensembles or not
         ds_in = ds_in.expand_dims('channels', axis=3).sortby('ensembles')
     else:
@@ -83,10 +80,7 @@ def HP_congif(params, data_dir_obs, lead_years):
             ds_raw_ensemble_mean = ds_raw_ensemble_mean.sel(year = obs_raw.year)
     #######################################################################################################################################
     nanremover = Spatialnanremove()## PG: Get an instance of the class
-    if params['correction']:
-        nanremover.fit(ds_raw_ensemble_mean[:,:12,...], obs_raw[:,:12,...]) ## PG:extract the commong grid points between training and obs data
-    else:
-        nanremover.fit(ds_raw_ensemble_mean[:,:12,...], ds_raw_ensemble_mean[:,:12,...]) ## PG:extract the commong grid points between training and obs data
+    nanremover.fit(ds_raw_ensemble_mean[:,:12,...], ds_raw_ensemble_mean[:,:12,...]) ## PG:extract the commong grid points between training and obs data
     ds_raw_ensemble_mean = nanremover.to_map(nanremover.sample(ds_raw_ensemble_mean)) ## PG: flatten and sample training data at those locations
     obs_raw = nanremover.to_map(nanremover.sample(obs_raw)) ## PG: flatten and sample obs data at those locations    
     #######################################################################################################################################
@@ -110,12 +104,11 @@ def smooth_curve(list, factor = 0.9):
 
 def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset , test_year, lead_time = None, n_runs=1, results_dir=None, numpy_seed=None, torch_seed=None):
     
-    if params['remove_ensemble_mean']:
-        assert not params['correction'], 'With correction set to True, cannot train with ensemble anomlalies.'
     
-    # if not params['non_random_decoder_initialization']:
-    #    assert any([all([params['time_features'] is not None, params['append_mode'] != 1]), params['condition_embedding_size'] is not None]), 'For random decoder initializaiton, conditions should be provided to the decoder ...' 
-    
+    if not params['non_random_decoder_initialization']:
+       if not params['remove_ensemble_mean']:
+            assert any([all([params['time_features'] is not None, params['append_mode'] != 1]), params['condition_embedding_size'] is not None]), 'For random decoder initializaiton, conditions should be provided to the decoder ...' 
+  
 
     if params['model'] == UNet:
             params["arch"] = '_default'
@@ -124,10 +117,8 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if params['version'] == 1:
 
         params['forecast_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0)),
-        ('standardize', Standardizer(axis = (0,1,2)))]
-        params['observations_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0))  ]
+        ('standardize', Standardizer())]
+        params['observations_preprocessing_steps'] = []
 
     elif params['version'] == 2:
 
@@ -151,6 +142,20 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
 
     for key, value in hyperparamater_grid.items():
             params[key] = value 
+
+    if params['lr_scheduler']:
+        start_factor = params['start_factor']
+        end_factor = params['end_factor']
+        total_iters = params['total_iters']
+        start_epoch = params['start_epoch']
+    else:
+        start_factor = end_factor = total_iters = start_epoch = None
+
+    ##### PG: Ensemble members to load 
+    ensemble_list = params['ensemble_list']
+    ###### PG: Add ensemble features to training features
+    ensemble_mode = params['ensemble_mode'] ##
+
     if 'hidden_dims' in hyperparamater_grid.keys():
         params['arch'] = None
     if params["arch"] == 3:
@@ -159,18 +164,29 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         params["hidden_dims"] = [[1500, 720, 360, 180, 90], [180, 360, 720, 1500]]
     if params['arch'] == 1:
         params["hidden_dims"] = [[ 720, 360, 180, 90,30], [90,180, 360, 720]]
+
+    if all([params['condition_embedding_size'] is not None, params['condition_dependant_latent'] is False]):
+        print('Warning: condemb_to_decoder turned True for prior is not condition dependant for cVAE ...')
+        params['condemb_to_decoder'] = True
+
+    if params['condition_dependant_latent']:
+        assert params['condition_embedding_size'] is not None, 'Specify condition embedding network size for condition dependant latent ...'
+        if params['prior_flow'] is None:
+            params['non_random_decoder_initialization'] = True
+            print('Warning: non_random_decoder_initialization turned on for condition dependant latent in cVAE to be sampled (flow is off) ...')
+            assert params['loss_reduction'] == 'sum', 'loss_reduction has to be sum for normalized flow priors'
+            
+        else:
+            assert params['non_random_decoder_initialization'] is False, 'non_random_decoder_initialization should be False for condition dependant flow based prior ...'
+        
+        params['full_conditioning'] = True
+        print('Warning: full_conditioning turned True for condition dependant latent in cVAE ...')
+
     if params['condition_embedding_size'] == 'encoder':
         params['condition_embedding_size'] = params["hidden_dims"][0]
 
-    if params['lr_scheduler']:
-        start_factor = params['start_factor']
-        end_factor = params['end_factor']
-        total_iters = params['total_iters']
 
-    ##### PG: Ensemble members to load 
-    ensemble_list = params['ensemble_list']
-    ###### PG: Add ensemble features to training features
-    ensemble_mode = params['ensemble_mode'] ##
+
     
     if 'atm_co2' in params['extra_predictors']:
         atm_co2 = xr.open_dataset('/home/rpg002/CMIP6_ssp245_xCO2atm_1982_2029.nc').ssp245
@@ -183,7 +199,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
          extra_predictors = None     
 
     if extra_predictors is not None:
-        if params["model"] in [Autoencoder_decoupled, Autoencoder]:
+        if params["model"] in [ Autoencoder]:
             weights = np.cos(np.ones_like(extra_predictors.lon) * (np.deg2rad(extra_predictors.lat.to_numpy()))[..., None])  # Moved this up
             weights = xr.DataArray(weights, dims = extra_predictors.dims[-2:], name = 'weights').assign_coords({'lat': extra_predictors.lat, 'lon' : extra_predictors.lon}) 
             extra_predictors = (extra_predictors * weights).sum(['lat','lon'])/weights.sum(['lat','lon'])
@@ -194,18 +210,18 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
             else:
                 ds_raw_ensemble_mean = xr.concat([ds_raw_ensemble_mean, extra_predictors.expand_dims(ensembles = ds_raw_ensemble_mean['ensembles'], axis = 2) ], dim = 'channels')
             extra_predictors = None
- 
-    hyperparam = params['hyperparam']
+
+
+
+    hyperparam = params["hyperparam"]
     reg_scale = params["reg_scale"]
     model = params["model"]
     hidden_dims = params["hidden_dims"]
     time_features = params["time_features"].copy() if params["time_features"] is not None else None
     epochs = params["epochs"]
     batch_size = params["batch_size"]
-    batch_size_correction = params['batch_size_correction']
     batch_normalization = params["batch_normalization"]
     dropout_rate = params["dropout_rate"]
-    batch_shuffle = params["batch_shuffle"]
     optimizer = params["optimizer"]
     lr = params["lr"]
 
@@ -214,7 +230,6 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
 
     loss_region = params["loss_region"]
     subset_dimensions = params["subset_dimensions"]
-    Biome = params['Biome']
     size_val_years = params['size_val_years']
     l2_reg = params["L2_reg"]
     conditional_embedding = True if params['condition_embedding_size'] is not None else False
@@ -229,17 +244,17 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
 
     
     print(f"Start run for test year {test_year}...")
-    if params['correction']:
-        train_years = ds_raw_ensemble_mean.year[ds_raw_ensemble_mean.year < test_year-size_val_years].to_numpy()
-    else:
-        train_years = ds_raw_ensemble_mean.year[ds_raw_ensemble_mean.year < test_year].to_numpy()
+    # if params['correction']:
+    train_years = ds_raw_ensemble_mean.year[ds_raw_ensemble_mean.year < test_year-size_val_years].to_numpy()
+    # else:
+    #     train_years = ds_raw_ensemble_mean.year[ds_raw_ensemble_mean.year < test_year].to_numpy()
 
     n_train = len(train_years)
     train_mask = create_train_mask(ds_raw_ensemble_mean[:n_train,...])
-    if not params['correction']:
-        train_mask = np.full(train_mask.shape, False, dtype=bool)
-        indices = np.random.choice(train_mask.size, int(size_val_years * train_mask.size), replace=False)
-        train_mask.flat[indices] = True
+    # if not params['correction']:
+    #     train_mask = np.full(train_mask.shape, False, dtype=bool)
+    #     indices = np.random.choice(train_mask.size, int(size_val_years * train_mask.size), replace=False)
+    #     train_mask.flat[indices] = True
 
     ds_baseline = ds_raw_ensemble_mean[:n_train,...]
     obs_baseline = obs_raw[:n_train,...]
@@ -248,6 +263,7 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         preprocessing_mask_fct = np.broadcast_to(train_mask[...,None,None,None,None], ds_baseline.shape)
     else:
         preprocessing_mask_fct = np.broadcast_to(train_mask[...,None,None,None], ds_baseline.shape)
+        
     preprocessing_mask_obs = np.broadcast_to(train_mask[...,None,None,None], obs_baseline.shape)
 
     if subset_dimensions is not None:
@@ -269,65 +285,42 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     if 'standardize' in ds_pipeline.steps:
         obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
     obs = obs_pipeline.transform(obs_raw)
-    del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
-    gc.collect()
-    if params['correction']:
-        year_max = ds[:n_train + size_val_years+1].year[-1].values
-    else:
-        year_max = ds[:n_train + 1].year[-1].values
 
+    ds_em = ds.mean('ensembles')
     if params['remove_ensemble_mean']:
-            ds_em = ds.mean('ensembles')
             ds = ds - ds_em
+    # if params['correction']:
+    year_max = ds[:n_train + size_val_years+1].year[-1].values
+    # else:
+    #     year_max = ds[:n_train + 1].year[-1].values
+
+
             
     # TRAIN MODEL
 
+    del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
+    gc.collect()
 
     ds_train = ds[:n_train,...]
     obs_train = obs[:n_train,...]
-    if params['correction']:
-        ds_validation = ds[n_train:n_train + size_val_years,...]
-        obs_validation = obs[n_train:n_train + size_val_years,...]
-    else:
-        ds_validation = ds[:n_train,...]
-        obs_validation = obs[:n_train,...]
-
-    if params['remove_ensemble_mean']:
-        ds_em_train = ds_em.sel(year = ds_train.year)
-        del ds_em
-
-    ##### PG: The ocean carbon flux has NaN values over land in both forecast and obs data and these are not necessarily in the excat same grid points. ###
-    ##### We need to extract the common grid points where both obs and model data exist. That said, we need to flatten both the training and target data
-    ##### I defined a Nanremover class. See preprocessing.py.
-        
+    # if params['correction']:
+    ds_validation = ds[n_train:n_train + size_val_years,...]
+    obs_validation = obs[n_train:n_train + size_val_years,...]
+    # else:
+    #     ds_validation = ds[:n_train,...]
+    #     obs_validation = obs[:n_train,...]
+     
     weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
     weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon}) # Create an DataArray to pass to Spatialnanremove() 
     weights_val = weights.copy()
-
     #### Set weights to 1!!:
-    # weights = xr.ones_like(weights)
-    ### Increase the weight over some biome :
-    if Biome is not None:
-        if type(Biome) == dict:
-            for ind, sc in Biome.items():
-                    weights = weights + (sc-1) * weights.where(biomes == ind).fillna(0)  
-        elif type(Biome) == list:
-            for ind in Biome:
-                    weights = weights + weights.where(biomes == ind).fillna(0) 
-        else:
-                weights = weights + weights.where(biomes == Biome).fillna(0)
-##########################################            
-    # nanremover = Spatialnanremove() ## PG: Get an instance of the class
-    # nanremover.fit(ds_train[:,:12,...], obs_train[:,:12,...]) ## PG:extract the commong grid points between training and obs data
-    nanremover = params['nanremover']
-    ds_train = nanremover.sample(ds_train) ## PG: flatten and sample training data at those locations
-    obs_train = nanremover.sample(obs_train) ## PG: flatten and sample obs data at those locations
+    weights = xr.ones_like(weights)
     ########################################################################
 
     if model in [UNet , CNN]: ## PG: If the model starts with a nn.Conv2d write back the flattened data to maps.
 
-        ds_train = nanremover.to_map(ds_train).fillna(0.0) ## PG: fill NaN values with 0.0 for training
-        obs_train = nanremover.to_map(obs_train).fillna(0.0) ## PG: fill NaN values with 0.0 for training
+        ds_train = ds_train.fillna(0.0) ## PG: fill NaN values with 0.0 for training
+        obs_train = obs_train.fillna(0.0) ## PG: fill NaN values with 0.0 for training
 
         img_dim = ds_train.shape[-2] * ds_train.shape[-1] 
         if loss_region is not None:
@@ -337,7 +330,9 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
             loss_region_indices = None
     
     else: ## PG: If you have a dense first layer keep the data flattened.
-        
+        nanremover = params['nanremover']
+        ds_train = nanremover.sample(ds_train) ## PG: flatten and sample training data at those locations
+        obs_train = nanremover.sample(obs_train) ## PG: flatten and sample obs data at those locations
         weights = nanremover.sample(weights) ## PG: flatten and sample weighs at those locations
         weights_val = nanremover.sample(weights_val)
         img_dim = ds_train.shape[-1] ## PG: The input dim is now the length of the flattened dimention.
@@ -348,32 +343,25 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         else:
             loss_region_indices = None
 
-    weights = weights.values
-    weights_val = weights_val.values
     del ds, obs
     gc.collect()
     torch.cuda.empty_cache() 
     torch.cuda.synchronize() 
+    weights = weights.values
+    weights_val = weights_val.values
 
     if time_features is None:
-
             add_feature_dim = 0
     else:
-
             add_feature_dim = len(time_features)
-    
     if extra_predictors is not None:
             add_feature_dim = add_feature_dim + len(params['extra_predictors'])
 
 
 
     if model == Autoencoder:
-        net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate, VAE = params['BVAE'], condition_embedding_dims = params['condition_embedding_size'], device = device)
-        if params['correction']:
-            net_decoder = Autoencoder_decoder(img_dim, hidden_dims[0][-1], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate,  device = device)             
-    elif model == Autoencoder_decoupled:
-        net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate)
-
+        net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate, VAE = params['BVAE'], condition_embedding_dims = params['condition_embedding_size'], full_conditioning = params["full_conditioning"] , condition_dependant_latent = params["condition_dependant_latent"], 
+                        min_posterior_variance = params['min_posterior_variance'], prior_flow = params['prior_flow'], condemb_to_decoder = params['condemb_to_decoder'],  device = device)
 
     net.to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -381,39 +369,38 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
         scheduler = lr_scheduler.LinearLR(optimizer, start_factor=start_factor, end_factor=end_factor, total_iters=total_iters)
 
     ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
-    train_set = XArrayDataset(ds_train, obs_train, mask=train_mask,lead_time_mask = params['lead_time_mask'], extra_predictors=extra_predictors, in_memory=True, lead_time=lead_time, time_features=time_features, aligned = True, year_max=year_max, conditional_embedding = conditional_embedding, cross_member_training = params['cross_member_training']) 
-    dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=batch_shuffle)
+    train_set = XArrayDataset(ds_train, obs_train, mask=train_mask, lead_time = lead_time, lead_time_mask = params['lead_time_mask'], extra_predictors=extra_predictors, in_memory=False,  time_features=time_features, aligned = True, year_max = year_max, conditional_embedding = conditional_embedding, cross_member_training = params['cross_member_training']) 
+    dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
     if conditional_embedding:
-        if params['remove_ensemble_mean']:
-            ds_train_conds = nanremover.sample(ds_em_train).stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()]
-            del ds_em_train
-        else:
-            ds_train_conds = ds_train.stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()].mean('ensembles')
+        if params['condition_type'] == 'climatology':
+                ds_em = xr.concat([ds_em.mean('year').expand_dims('year', axis = 0) for _ in range(len(ds_em.year))], dim = 'year').assign_coords(year = ds_em.year.values)
+        ds_train_conds = nanremover.sample(ds_em.sel(year = ds_train.year)).stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()]
         if lead_time is not None:
             ds_train_conds = ds_train_conds.where((ds_train_conds.lead_time >=  (lead_time - 1) * 12 + 1) & (ds_train_conds.lead_time < (lead_time *12 )+1), drop = True)
         ds_train_conds = torch.from_numpy(ds_train_conds.to_numpy())
+        ds_validation_conds = nanremover.sample(ds_em.sel(year = ds_validation.year)).stack(flattened=('year','lead_time')).transpose('flattened',...)
+        ds_validation_conds = torch.from_numpy(ds_validation_conds.to_numpy())
         
     
     criterion = WeightedMSESignLossKLD(weights=weights, device=device, hyperparam=hyperparam, reduction=params['loss_reduction'], loss_area=loss_region_indices,  scale = reg_scale)
-  # criterion = VAEloss(weights = weights , device = device)
 
     # EVALUATE MODEL
     ##################################################################################################################################
     ds_validation = nanremover.sample(ds_validation, mode = 'Eval')  ## PG: Sample the test data at the common locations
     obs_validation = nanremover.sample(obs_validation)
     if model == UNet:
-        ds_validation = nanremover.to_map(ds_validation).fillna(0.0)  ## PG: Write back to map if the model starts with a nn.Conv2D
-        obs_validation = nanremover.to_map(obs_validation).fillna(0.0)
+        ds_validation = ds_validation.fillna(0.0)  ## PG: Write back to map if the model starts with a nn.Conv2D
+        obs_validation = obs_validation.fillna(0.0)
 
     # val_batch_size = int(np.ceil(batch_size/len(ensemble_list)))
-    val_batch_size = batch_size
-    if params['correction']:
-        val_mask = create_train_mask(ds_validation)
-    else:
-        val_mask = ~train_mask
+    # val_batch_size = batch_size
+    # if params['correction']:
+    val_mask = create_train_mask(ds_validation)
+    # else:
+        # val_mask = ~train_mask
     validation_set = XArrayDataset(ds_validation, obs_validation, mask=val_mask,lead_time = lead_time, extra_predictors=extra_predictors, lead_time_mask = params['lead_time_mask'], time_features=time_features, in_memory=False, aligned = True, year_max=year_max, BVAE= params['BVAE'], cross_member_training = params['cross_member_training']) 
-    dataloader_val = DataLoader(validation_set, batch_size=val_batch_size, shuffle=True)   
+    # dataloader_val = DataLoader(validation_set, batch_size=1, shuffle=False)   
  
 
     criterion_eval = WeightedMSESignLossKLD(weights=weights_val, device=device, hyperparam=1, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale = reg_scale)
@@ -426,27 +413,42 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     epoch_loss_train_MSE = []
     epoch_loss_val = []
     epoch_loss_val_KL = []
+    epoch_loss_val_MSE = []
     epoch_loss_val_ens_mean = []
-    epoch_loss_val_mean = []
-
+    epoch_loss_val_ens_std = []
+    
+    num_batches = len(dataloader)
+    step = 0
     for epoch in tqdm.tqdm(range(epochs)):
-
-        net.train()
-        batch_loss = 0
-        batch_loss_MSE = 0
-        batch_loss_KLD = 0
-        if type(params['beta']) == dict:
-            beta = params['beta']['start'] + (params['beta']['end'] - params['beta']['start']) * min(epoch/params['beta']['epochs'], 1)
-        else:
-            beta = params['beta']
+        # if type(params['beta']) == dict:
+        #     beta = params['beta']['start'] + (params['beta']['end'] - params['beta']['start']) * min(epoch/params['beta']['epochs'], 1)
+        # else:
+        #     beta = params['beta']
 
         if all([params['cross_member_training'], epoch>=1]):
                 train_set, shuffle_idx = train_set.shuffle_target_ensembles( return_shuffled_idx = True)
                 dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
                 validation_set = validation_set.shuffle_target_ensembles(shuffle_idx = shuffle_idx)  
-                dataloader_val = DataLoader(validation_set, batch_size=val_batch_size, shuffle=True)   
+                dataloader_val = DataLoader(validation_set, batch_size=1, shuffle=True)
 
+        net.train()
+        batch_loss = 0
+        batch_loss_MSE = 0
+        batch_loss_KLD = 0
         for batch, (x, y) in enumerate(dataloader):
+
+            if type(params['beta']) == dict:
+                if epoch + 1< params['beta']['start_epoch']:
+                    beta = params['beta']['start']
+                else:
+                    range_epochs = (params['beta']['end_epoch'] - params['beta']['start_epoch'] + 1)*num_batches
+                    step_beta = np.clip((step - (params['beta']['start_epoch'] - 1)* num_batches) /(range_epochs),a_min = 0, a_max = None)
+                    beta = params['beta']['start'] + (params['beta']['end'] - params['beta']['start']) * min(step_beta, 1)
+
+            else:
+                beta = params['beta']
+            step = step +1
+
             if conditional_embedding:
                 cond_idx = x[-1]
                 x = [x[i] for i in range(len(x) - 1)] if len(x) >2 else x[0]
@@ -463,148 +465,172 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
                 y = y.to(device)
                 m  = None
             optimizer.zero_grad()
-            if not params['cross_member_training']:
-                y = x[0].to(device) if (type(x) == list) or (type(x) == tuple) else x.to(device)
-                adjusted_forecast, mu, log_var = net(x, condition = cond, sample_size = params['training_sample_size'])
-                adjusted_forecast = adjusted_forecast.mean(0)
-                # adjusted_forecast = torch.flatten(adjusted_forecast, start_dim= 0 , end_dim=1)
-            
+            # if not params['cross_member_training']:
+            y = x[0].to(device) if (type(x) == list) or (type(x) == tuple) else x.to(device)
+            if params['condition_dependant_latent']:
+                if net.flow is None:
+                    adjusted_forecast, mu, log_var, cond_mu, cond_log_var = net(x, condition = cond,  sample_size = params['training_sample_size'])
+                    loss, MSEL, KLDL = criterion(adjusted_forecast, y.unsqueeze(0).expand_as(adjusted_forecast) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True, print_loss=False )
+                else:
+                    adjusted_forecast, mu, log_var, cond_emb = net(x, condition = cond,  sample_size = params['training_sample_size'])
+                    loss, MSEL, KLDL = criterion(adjusted_forecast, y.unsqueeze(0).expand_as(adjusted_forecast) ,mu, log_var, cond_mu = cond_emb, cond_log_var = None ,beta = beta, mask = m, return_ind_loss=True, normalized_flow = net.flow, print_loss=False  )
+                # adjusted_forecast = adjusted_forecast.mean(0)
+                # loss, MSE, KLD = criterion(adjusted_forecast, y.unsqueeze(0).expand_as(adjusted_forecast) ,mu, log_var, cond_mu = cond_mu, cond_log_var = cond_log_var ,beta = beta, mask = m, return_ind_loss=True, normalized_flow = net.flow )
             else:
-                ### first generate mu and sigma then sample from z
-                pass
-            loss, MSEL, KLDL = criterion(adjusted_forecast, y ,mu, log_var, beta = beta, mask = m, return_ind_loss=True, print_loss = True)
+                adjusted_forecast, mu, log_var = net(x, condition = cond,  sample_size = params['training_sample_size'])
+                # adjusted_forecast = adjusted_forecast.mean(0)
+                loss, MSEL, KLDL = criterion(adjusted_forecast, y.unsqueeze(0).expand_as(adjusted_forecast) ,mu, log_var,beta = beta, mask = m, return_ind_loss=True, normalized_flow = net.flow, print_loss=False  )
+
+                # adjusted_forecast = torch.flatten(adjusted_forecast, start_dim= 0 , end_dim=1)
+            # else:
+                #     ## first generate mu and sigma then sample from z
+                #     pass
+
 
             batch_loss += loss.item()
             batch_loss_MSE += MSEL.item()
             batch_loss_KLD += KLDL.item()
             loss.backward()
             optimizer.step()
-            
-        epoch_loss_train.append(batch_loss / len(dataloader))
-        epoch_loss_train_KL.append(batch_loss_KLD / len(dataloader))
-        epoch_loss_train_MSE.append(batch_loss_MSE / len(dataloader))
+        epoch_loss_train.append(batch_loss / num_batches)
+        epoch_loss_train_KL.append(batch_loss_KLD / num_batches)
+        epoch_loss_train_MSE.append(batch_loss_MSE / num_batches)
 
         if params['lr_scheduler']:
-            scheduler.step()
+            if epoch +1 >= start_epoch:
+                scheduler.step()
         net.eval()
         val_loss = 0
         val_loss_KL = 0
+        val_loss_MSE = 0
         val_loss_ens_mean = 0
-        val_loss_mean = 0
+        val_loss_ens_std = 0
         
-        for batch, (x, target) in enumerate(dataloader_val):         
+        
+        for batch, (x, target) in enumerate(validation_set):         
             with torch.no_grad():            
                 if (type(x) == list) or (type(x) == tuple):
-                    test_raw = (x[0].to(device), x[1].to(device))
-                    test_raw = (torch.flatten(test_raw[0], start_dim= 0 , end_dim=1), torch.flatten( test_raw[1].unsqueeze(1).expand(test_raw[1].shape[0], test_raw[0].shape[1], *test_raw[1].shape[1:]), start_dim= 0 , end_dim=1))
+                    val_raw = (x[0].to(device), x[1].to(device))
+                    val_raw = (torch.flatten(val_raw[0], start_dim= 0 , end_dim=1), torch.flatten( val_raw[1].unsqueeze(1).expand(val_raw[1].shape[0], val_raw[0].shape[1], *val_raw[1].shape[1:]), start_dim= 0 , end_dim=1))
                 else:
-                    test_raw = x.to(device)
-                    test_raw = torch.flatten(test_raw, start_dim= 0 , end_dim=1)
+                    val_raw = x.to(device)
+                    val_raw = torch.flatten(val_raw, start_dim= 0 , end_dim=1)
                 if (type(target) == list) or (type(target) == tuple):
-                    test_obs, m = (target[0].to(device), target[1].to(device))
+                    val_obs, m = (target[0].to(device), target[1].to(device))
                 else:
-                    test_obs = target.to(device)
+                    val_obs = target.to(device)
                     m = None
                 if conditional_embedding:
-                        cond = x[0].mean(axis = -3).to(device) if (type(x) == list) or (type(x) == tuple) else x.mean(axis = -3).to(device)        
+                        cond = ds_validation_conds[batch].type_as(val_obs).to(device)  #!!!!!!!! WROONG !!!!!!!   
                 else:
                         cond = None
-                if params['cross_member_training']:
-                    test_obs = torch.flatten(test_obs, start_dim= 0 , end_dim=1)
+
+                val_obs = val_raw[0]  if (type(x) == list) or (type(x) == tuple) else val_raw
+                if params['condition_dependant_latent']:
+                        if net.flow is None:
+                            val_adjusted, val_mu, val_log_var, val_cond_mu, val_cond_log_var = net(val_raw, condition = cond,  sample_size = params['training_sample_size'])
+                            loss_, loss_MSE, loss_KL = criterion_eval(val_adjusted, val_obs.unsqueeze(0).expand_as(val_adjusted) ,val_mu, val_log_var, cond_mu = val_cond_mu, cond_log_var = val_cond_log_var ,beta = beta, mask = m, return_ind_loss=True, print_loss= False )
+                        else:
+                            val_adjusted, val_mu, val_log_var, val_cond_emb = net(val_raw, condition = cond,  sample_size = params['training_sample_size'])
+                            loss_, loss_MSE, loss_KL = criterion_eval(val_adjusted, val_obs.unsqueeze(0).expand_as(val_adjusted) ,val_mu, val_log_var, cond_mu = val_cond_emb, cond_log_var = None ,beta = beta, mask = m, return_ind_loss=True, normalized_flow = net.flow, print_loss= False )
                 else:
-                    test_obs = test_raw[0]  if (type(x) == list) or (type(x) == tuple) else test_raw
-
-                # if not params['non_random_decoder_initialization']:
-                #     sample_size = test_raw[0].shape[0] if (type(test_raw) == list) or (type(test_raw) == tuple) else test_raw.shape[0]
-                #     z =  Normal(torch.zeros(sample_size, net.latent_size), torch.ones((sample_size, net.latent_size))).rsample(sample_shape=(params['BVAE'],)).to(device)
-                #     if all([params['time_features'] is not None, params['append_mode'] != 1]):
-                #         z = torch.cat([z, test_raw[1].expand((1, *test_raw[1].shape))], dim=-1)
-                #     if conditional_embedding:
-                #         cond_embedded = net.embedding(cond.to(device).flatten(start_dim=1))
-                #         cond_embedded = cond_embedded.unsqueeze(-2).expand(cond_embedded.shape[0], int(sample_size/cond_embedded.shape[0]), net.embedding_size)
-                #         cond_embedded = torch.flatten(cond_embedded, start_dim = 0, end_dim = 1)
-                #         cond_embedded = cond_embedded.unsqueeze(0).expand((z.shape[0], z.shape[1], net.embedding_size))
-                #         z = torch.cat([z, cond_embedded], dim=-1)     
-
-                #         out_shape = z.shape
-                #         out = net.decoder(torch.flatten(z, start_dim = 0, end_dim = 1))
-                #         out = torch.unflatten(out, dim = 0 , sizes = out_shape[0:2])
-    
-                #         test_adjusted =   out.view((1, *test_raw[0].shape) ) if (type(x) == list) or (type(x) == tuple) else out.view((1, *test_raw.shape) )
-
-                # else:
-                test_adjusted, mu_val, log_var_val  =  net(test_raw, condition = cond, sample_size =  params['training_sample_size'])
-                test_adjusted = test_adjusted.mean(0)
-                # test_adjusted = torch.flatten(test_adjusted, start_dim= 0 , end_dim=1)
-
-                loss_, loss_mean, loss_KL = criterion_eval(test_adjusted, test_obs ,mu_val, log_var_val, beta = beta, mask = m, return_ind_loss=True, print_loss = False)
-
+                        val_adjusted, val_mu, val_log_var = net(val_raw, condition = cond,  sample_size = params['training_sample_size'])
+                        loss_, loss_MSE, loss_KL = criterion_eval(val_adjusted, val_obs.unsqueeze(0).expand_as(val_adjusted) ,val_mu, val_log_var,beta = beta, mask = m, return_ind_loss=True, normalized_flow = net.flow , print_loss= False)
+                       
                 val_loss += loss_.item()
                 val_loss_KL += loss_KL.item()
-                val_loss_mean += loss_mean.item()
+                val_loss_MSE += loss_MSE.item()
                 
-                test_obs = torch.mean(x[0], 1)  if (type(x) == list) or (type(x) == tuple) else  torch.mean(x, 1)
-                sample_size = x[0].shape[0] if (type(x) == list) or (type(x) == tuple) else x.shape[0]
-                if params['non_random_decoder_initialization']:
-                    ad, mu, log_var = net(test_raw, condition = cond, sample_size = 1)
-                    mu = torch.unflatten(mu, dim = 0, sizes = (-1,len(ensemble_list)))
-                    var = torch.exp(torch.unflatten(log_var, dim = 0, sizes = (-1,len(ensemble_list)))) + 1e-4
-                    z =  Normal(torch.mean(mu, -2), torch.std(mu, -2)).rsample(sample_shape=(params['BVAE'] * len(ensemble_list),)).to(device)
-                    # z = torch.transpose(z, 1,0)
+                sample_size = val_raw[0].shape[0] if (type(val_raw) == list) or (type(val_raw) == tuple) else val_raw.shape[0]
+                if params['non_random_decoder_initialization'] is False:
+                    z =  Normal(torch.zeros(net.latent_size), torch.ones(( net.latent_size))).rsample(sample_shape=(params['BVAE']* sample_size,)).to(device)
+
                 else:
-                    z =  Normal(torch.zeros((sample_size, net.latent_size)), torch.ones((sample_size, net.latent_size))).rsample(sample_shape=(params['BVAE'] * len(ensemble_list),)).to(device)
+                    if params['condition_dependant_latent']:
+                        _, _, _, val_cond_mu, val_cond_log_var = net(val_raw, condition = cond, sample_size = 1)
+                        val_cond_var = torch.exp(val_cond_log_var) + 1e-4
+                        z =  Normal(cond_mu, torch.sqrt(val_cond_var)).rsample(sample_shape=(params['BVAE'] * sample_size,)).squeeze().to(device)
+                        
+                    else:
+                        _, val_mu, val_log_var = net(val_raw, condition = cond, sample_size = 1)
+                        val_var = torch.exp(val_log_var) + 1e-4
+                        z =  Normal(torch.mean(val_mu, 0), torch.std(val_mu, 0)).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
+                        # z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
+                        
+                ### cut from above
+                
+                if params['prior_flow'] is not None:
+                        if params['condition_dependant_latent']:
+                            val_cond_embedded = net.embedding(cond.to(device))
+                            # cond_embedded = net.condition_embedding(cond_embedded.flatten(start_dim=1))
+                            val_cond_embedded = val_cond_embedded.expand((z.shape[0], net.embedding_size))
+                        else:
+                            val_cond_embedded = None
+                        z,_ = net.flow.inverse(z, condition = val_cond_embedded)
 
                 if all([params['time_features'] is not None, params['append_mode'] != 1]):
-                        z = torch.cat([z, test_raw[1].unsqueeze(0).expand((params['BVAE'], *test_raw[1].shape))], dim=-1)
-                if conditional_embedding:
-                        cond_embedded = net.embedding(torch.flatten(cond, start_dim = 1).to(device))
-                        cond_embedded = cond_embedded.unsqueeze(-3).expand(params['BVAE'] * len(ensemble_list), *cond_embedded.shape)
-                        z = torch.cat([z, cond_embedded], dim=-1)
-                z = torch.transpose(z,1,0)            
-                out_shape = z.shape
-                test_adjusted = net.decoder(torch.flatten(z, start_dim = 0, end_dim = 1))
-                test_adjusted = torch.unflatten(test_adjusted, dim = 0 , sizes = out_shape[0:2]).mean(-2).unsqueeze(-2)
-                loss_val_ensemble = criterion_eval_mean(test_adjusted.detach().to('cpu'), test_obs)
+                    z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
+                    z = torch.cat([z, val_raw[1].unsqueeze(0).expand((params['BVAE'], *val_raw[1].shape))], dim=-1)
+                    z = torch.flatten(z, start_dim = 0, end_dim = 1)
 
-                val_loss_ens_mean += loss_val_ensemble.item()
+                if all([ conditional_embedding is True,  params['condemb_to_decoder']]) :
+                    val_cond_embedded = net.embedding(cond.to(device))
+                    if all([params['condition_dependant_latent'], params['prior_flow'] is None]):
+                        val_cond_embedded = net.condition_mu(val_cond_embedded.flatten(start_dim=1))
+                    val_cond_embedded = val_cond_embedded.expand((z.shape[0], net.embedding_size))
+                    z = torch.cat([z, val_cond_embedded], dim=-1)
 
-        epoch_loss_val.append(val_loss / len(dataloader_val))
-        epoch_loss_val_ens_mean.append(val_loss_ens_mean / len(dataloader_val))
-        epoch_loss_val_KL.append(val_loss_KL / len(dataloader_val))
-        epoch_loss_val_mean.append(val_loss_mean / len(dataloader_val))
+                val_adjusted = net.decoder(z)
+                # test_adjusted = torch.unflatten(test_adjusted, dim = 0 , sizes = out_shape[0:2]).mean(-2).unsqueeze(-2)
+                loss_val_ensemble_mean = criterion_eval_mean(val_adjusted.detach().to('cpu').mean(0), val_obs.mean(0).detach().to('cpu'))
+                loss_val_ensemble_std = criterion_eval_mean(val_adjusted.detach().to('cpu').std(0), val_obs.std(0).detach().to('cpu'))
+
+                val_loss_ens_mean += loss_val_ensemble_mean.item()
+                val_loss_ens_std += loss_val_ensemble_std.item()
+
+
+        epoch_loss_val.append(val_loss / len(validation_set))
+        epoch_loss_val_KL.append(val_loss_KL / len(validation_set))
+        epoch_loss_val_MSE.append(val_loss_MSE / len(validation_set))
+
+        epoch_loss_val_ens_mean.append(val_loss_ens_mean / len(validation_set))
+        epoch_loss_val_ens_std.append(val_loss_ens_std / len(validation_set))
+
         # Store results as NetCDF            
-    del adjusted_forecast, y, train_set,validation_set, dataloader, dataloader_val, x , m, test_raw, test_obs,  target, test_adjusted, net
+    del adjusted_forecast, y, train_set,validation_set, dataloader, x , m, val_raw, val_obs,  target, val_adjusted, net
     gc.collect()
     torch.cuda.empty_cache() 
     torch.cuda.synchronize() 
     epoch_loss_val = smooth_curve(epoch_loss_val)
     epoch_loss_val_KL = smooth_curve(epoch_loss_val_KL)
-    epoch_loss_val_mean = smooth_curve(epoch_loss_val_mean)
+    epoch_loss_val_MSE = smooth_curve(epoch_loss_val_MSE)
     epoch_loss_val_ens_mean = smooth_curve(epoch_loss_val_ens_mean)
+    epoch_loss_val_ens_std = smooth_curve(epoch_loss_val_ens_std)
 
     plt.figure(figsize = (8,10))
-    plt.subplot(2,1,1)
-    plt.plot(np.arange(2,epochs+1), epoch_loss_train[1:], label = 'Train')
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], label = 'Validation')
+    plt.subplot(3,1,1)
+    plt.plot(np.arange(2,epochs+1), epoch_loss_train[1:], label = 'Train', color = 'b')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val[1:], label = 'Validation', color = 'orange')
     plt.title(f'{hyperparamater_grid}')
     plt.legend(loc='upper right')
     plt.ylabel('MSE + KLD')
-    # plt.twinx()
-    plt.plot(np.arange(2,epochs+1), epoch_loss_train_MSE[1:], label = 'Train MSE', alpha = 0.5)
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val_mean[1:], label = 'Validation MSE', alpha = 0.5)
-    # plt.ylabel('MSE')
-    # plt.legend(loc='lower right')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_train_MSE[1:], label = 'Train MSE', alpha = 0.5, color = 'b')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val_MSE[1:], label = 'Validation MSE', alpha = 0., color = 'orange')
     plt.grid()
     plt.show()
-    plt.subplot(2,1,2)
+    plt.subplot(3,1,2)
     plt.plot(np.arange(2,epochs+1), epoch_loss_train_KL[1:], label = 'Train KLD')
     plt.plot(np.arange(2,epochs+1), epoch_loss_val_KL[1:], label = 'Validation KLD')
-    plt.legend(loc='upper right')
+    plt.xlabel('Epoch') 
     plt.ylabel('KLD')
-    plt.twinx()
-    plt.plot(np.arange(2,epochs+1), epoch_loss_val_ens_mean[1:], label = 'Validation Ensemble mean MSE',  color = 'k', alpha = 0.5)
+    plt.legend(loc='upper right')
+    plt.grid()
+    plt.show()
+    plt.subplot(3,1,3)
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val_ens_mean[1:], label = 'Validation Ensemble mean MSE',  color = 'k')
+    plt.plot(np.arange(2,epochs+1), epoch_loss_val_ens_std[1:], label = 'Validation Ensemble std MSE',  color = 'b')
     plt.ylabel('MSE')
-    plt.legend(loc='lower right')
+    plt.legend(loc='upper right')
     plt.xlabel('Epoch') 
     plt.grid()
     plt.show()
@@ -615,10 +641,10 @@ def training_hp(hyperparamater_grid: dict, params:dict, ds_raw_ensemble_mean: XA
     with open(Path(results_dir, "Hyperparameter_training.txt"), 'a') as f:
         f.write(
   
-            f"{hyperparamater_grid} ---> val_loss at best epoch: {epoch_loss_val[np.argmin(epoch_loss_val_mean)]} at {np.argmin(epoch_loss_val_mean)+1}  (MSE : {np.min(epoch_loss_val_mean)})\n" +  ## PG: The scale to be passed to Signloss regularization
+            f"{hyperparamater_grid} ---> val_loss at best epoch: {epoch_loss_val[np.argmin(epoch_loss_val_MSE)]} at {np.argmin(epoch_loss_val_MSE)+1}  (MSE : {np.min(epoch_loss_val_MSE)})\n" +  ## PG: The scale to be passed to Signloss regularization
             f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
         )
-    return np.min(epoch_loss_val_mean), epoch_loss_val, epoch_loss_val_KL, epoch_loss_val_mean, epoch_loss_val_ens_mean, epoch_loss_train
+    return np.min(epoch_loss_val_MSE), epoch_loss_val, epoch_loss_val_KL, epoch_loss_val_MSE, epoch_loss_val_ens_mean,epoch_loss_val_ens_std, epoch_loss_train
 
                                  #########         ##########
 
@@ -629,8 +655,9 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
 
     val_losses = np.zeros([y_end - y_start + 1 , len(hyperparameterspace), params['epochs']]) ####
     val_losses_KL = np.zeros([y_end - y_start + 1 , len(hyperparameterspace), params['epochs']]) ####
-    val_losses_mean = np.zeros([y_end - y_start + 1 , len(hyperparameterspace), params['epochs']]) ####
+    val_losses_MSE = np.zeros([y_end - y_start + 1 , len(hyperparameterspace), params['epochs']]) ####
     val_losses_ens_mean = np.zeros([y_end - y_start + 1 , len(hyperparameterspace), params['epochs']]) ####
+    val_losses_ens_std = np.zeros([y_end - y_start + 1 , len(hyperparameterspace), params['epochs']]) ####
     train_losses = np.zeros([y_end - y_start + 1, len(hyperparameterspace), params['epochs']]) ####
 
     for ind_, test_year in enumerate(range(y_start,y_end+1)):
@@ -646,7 +673,10 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
         if  params['lr_scheduler']:
             start_factor = params['start_factor']
             end_factor = params['end_factor']
+            start_epoch = params['start_epoch'] 
             total_iters = params['total_iters']
+        else:
+            start_factor = end_factor = total_iters = start_epoch = None
 
         with open(Path(out_dir, "Hyperparameter_training.txt"), 'w') as f:
             f.write(
@@ -660,33 +690,34 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
                 f"batch_normalization\t{params['batch_normalization']}\n" +
                 f"dropout_rate\t{params['dropout_rate']}\n" +
                 f"lr\t{params['lr']}\n" +
-                f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
+                f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs starting {start_epoch}\n" + 
                 f"L2_reg\t{params['L2_reg']}\n" +
                 f"Lead time mask\t{params['lead_time_mask']}\n" +
                 f"BVAE_default\t1\n" +
                 f"training_sample_size_default\t{params['training_sample_size']}\n" +
-                f"loss_reduction\t{params['loss_reduction']}\n"  + 
-                f"Correction\t{params['correction']}\n" +
-                f"batch_size_correction\t{params['batch_size_correction']}\n\n\n"
+                f"lead_time_mask\t{params['lead_time_mask']}\n" + 
+                f"condition_embedding_size\t{params['condition_embedding_size']}\n" +
+                f"condition_type\t{params['condition_type']}\n" +
+                f"non_random_decoder_initialization\t{params['non_random_decoder_initialization']}\n" + 
+                f"prior_flow\t{params['prior_flow']}\n" +
+                f"min_posterior_variance\t{params['min_posterior_variance']}\n" +
+                f"loss_reduction\t{params['loss_reduction']}\n\n\n"  + 
                 ' ----------------------------------------------------------------------------------\n'
             )
         
-
-        
         losses = np.zeros(len(hyperparameterspace))
- 
 
-       
         for ind, dic in enumerate(hyperparameterspace):
-            try:
+            # try:
                 print(f'Training for {dic}')
-                losses[ind], val_losses[ind_, ind, :], val_losses_KL[ind_, ind, :], val_losses_mean[ind_, ind, :],  val_losses_ens_mean[ind_, ind, :], train_losses[ind_, ind, :] = training_hp( ds_raw_ensemble_mean =  ds_raw_ensemble_mean,obs_raw = obs_raw , hyperparamater_grid= dic, lead_time = lead_time , params = params ,test_year=test_year, n_runs=n_runs, results_dir=out_dir, numpy_seed=numpy_seed, torch_seed=torch_seed)
-            except:
-                with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
-                    f.write(
-                    f"{dic} ---> Non trainable! \n" +  ## PG: The scale to be passed to Signloss regularization
-                    f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
-                        ) 
+                losses[ind], val_losses[ind_, ind, :], val_losses_KL[ind_, ind, :], val_losses_MSE[ind_, ind, :],  val_losses_ens_mean[ind_, ind, :], val_losses_ens_std[ind_, ind, :], train_losses[ind_, ind, :] = training_hp( ds_raw_ensemble_mean =  ds_raw_ensemble_mean,obs_raw = obs_raw , hyperparamater_grid= dic, lead_time = lead_time , params = params ,test_year=test_year, n_runs=n_runs, results_dir=out_dir, numpy_seed=numpy_seed, torch_seed=torch_seed)
+                
+            # except:
+            #     with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
+            #         f.write(
+            #         f"{dic} ---> Non trainable! \n" +  ## PG: The scale to be passed to Signloss regularization
+            #         f"-------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n" 
+            #             ) 
 
         
         with open(Path(out_dir, "Hyperparameter_training.txt"), 'a') as f:
@@ -712,13 +743,17 @@ def run_hp_tunning( ds_raw_ensemble_mean: XArrayDataset ,obs_raw: XArrayDataset,
     ds_val_KL.attrs['hyperparameters'] = list(config_dict.keys())
     ds_val_KL.to_netcdf(out_dir_x + '/validation_losses_KL.nc')
 
-    ds_val_mean = xr.DataArray(val_losses_mean, dims = ['test_years', 'hyperparameters','epochs'], name = 'Validation_loss').assign_coords({'test_years' : np.arange(y_start,y_end +1 ), 'hyperparameters': coords})
-    ds_val_mean.attrs['hyperparameters'] = list(config_dict.keys())
-    ds_val_mean.to_netcdf(out_dir_x + '/validation_losses_mean.nc')
+    ds_val_MSE = xr.DataArray(val_losses_MSE, dims = ['test_years', 'hyperparameters','epochs'], name = 'Validation_loss').assign_coords({'test_years' : np.arange(y_start,y_end +1 ), 'hyperparameters': coords})
+    ds_val_MSE.attrs['hyperparameters'] = list(config_dict.keys())
+    ds_val_MSE.to_netcdf(out_dir_x + '/validation_losses_MSE.nc')
 
     ds_val_ens_mean = xr.DataArray(val_losses_ens_mean, dims = ['test_years', 'hyperparameters','epochs'], name = 'Validation_loss').assign_coords({'test_years' : np.arange(y_start,y_end +1 ), 'hyperparameters': coords})
     ds_val_ens_mean.attrs['hyperparameters'] = list(config_dict.keys())
     ds_val_ens_mean.to_netcdf(out_dir_x + '/validation_losses_ens_mean.nc')
+
+    ds_val_ens_std = xr.DataArray(val_losses_ens_std, dims = ['test_years', 'hyperparameters','epochs'], name = 'Validation_loss').assign_coords({'test_years' : np.arange(y_start,y_end +1 ), 'hyperparameters': coords})
+    ds_val_ens_std.attrs['hyperparameters'] = list(config_dict.keys())
+    ds_val_ens_std.to_netcdf(out_dir_x + '/validation_losses_ens_std.nc')
 
     ds_train = xr.DataArray(train_losses, dims = ['test_years', 'hyperparameters','epochs'], name = 'Train_loss').assign_coords({'test_years' : np.arange(y_start,y_end +1), 'hyperparameters': coords})
     ds_train.attrs['hyperparameters'] = list(config_dict.keys())
@@ -742,42 +777,38 @@ if __name__ == "__main__":
         "extra_predictors" : [],
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'LE',
-        "epochs": 150,
-        "batch_size": 50,
-        "reg_scale" : 0,
-        'beta' : 1,
-        'hyperparam' : 1,
+        "epochs": 100,
+        "batch_size": 100,    
         "batch_normalization": False,
         "dropout_rate": 0,
+        "L2_reg" : 0,
         "append_mode": 1,
+        'hyperparam' : 1,
+        "reg_scale" : 0,
+        'beta' : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.0001,
-        "batch_shuffle" : True,
+        "lr": 0.00001,
         "loss_region": None,
         "subset_dimensions": None,
         "lead_time_mask" : None,
-        "L2_reg" : 0,
-        'lr_scheduler' : True,
+        'lr_scheduler' : False,
         'BVAE' : 10,
         'training_sample_size' : 1,
-        'non_random_decoder_initialization' : True,
-        'condition_embedding_size' : None,
+        'non_random_decoder_initialization' : False,
+        'condition_embedding_size' : 'encoder',
+        'condition_type' : 'ensemble_mean', # 'ensemble_mean' or 'climatology',
+        'condemb_to_decoder' : True, 
+        'min_posterior_variance' : None,# np.array([0.05]),
+        'condition_dependant_latent' : False,
+        'prior_flow' : None,# {'type' : MAF, 'num_layers' : 10},
+        'full_conditioning' : False,
         'cross_member_training' : False,
         'remove_ensemble_mean' : False,
-        'correction' : False,
-        'batch_size_correction' : 64,
-        'loss_reduction' : 'sum' # mean or sum
+        'loss_reduction' : 'mean' # mean or sum
     }
 
 
-    if params["model"] not in [Autoencoder, Autoencoder_decoupled]:
-        params["append_mode"] = None
-
-
     params['ensemble_list'] = np.arange(1,21)#[f'r{e}i1p2f1' for e in range(1,21,1)] ## PG
-
-    biomes = xr.open_dataset('/home/rpg002/fgco2_decadal_forecast_adjustment/Time_Varying_Biomes.nc').MeanBiomes.transpose()
-    params['Biome'] = None
 
     if fake_data is not None:
         if fake_data == '2pi':
@@ -798,7 +829,7 @@ if __name__ == "__main__":
     y_start = 2014
     y_end = 2014
     # y_end = ds_raw_ensemble_mean.year[-1].values +1 
-    params['size_val_years'] = 0.005
+    params['size_val_years'] = 3
 
     # config_dict = {'L2_reg' : [0.00001, 0.0001] , 'dropout_rate' : [0.2, 0.1], 'batch_size' :[8,16,64] }
     # config_dict = { 'hidden_dims' : [ [[1500, 1500,1500,1500, 2], [1500,1500, 1500, 1500]], [[1500, 1500,1500,1500,1500, 2], [1500,1500,1500, 1500, 1500]],
@@ -807,10 +838,11 @@ if __name__ == "__main__":
     #                'training_sample_size' : [1,100],
     #                }
 
-    config_dict = { 'hidden_dims' : [ [[1500, 1500,1500,1500,1500,1500,1500,1500, 2], [1500,1500,1500,1500,1500,1500, 1500, 1500]],  [[1500,1500,1500, 1500,1500,1500,1500,1500, 1500,2], [1500,1500,1500, 1500,1500,1500,1500,1500, 1500]]],
-                   'beta' : [0.25,  0.01,0.005],
-                    'batch_size' : [100,200],
-                    'drop_out' : [0,0.2]}
+    config_dict = { 'hidden_dims' : [ [[1500, 1500,1500,1500,1500,1500,1500,1500, 2], [1500,1500,1500,1500,1500,1500, 1500, 1500]],  [[1500,1500,1500, 1500,2], [1500,1500,1500, 1500]]],
+                   'beta' : [ 0.01, 0.05, dict(start = 0, end = 0.2, start_epoch = 1 , end_epoch = 100), dict(start = 0, end = 0.2, start_epoch = 10 , end_epoch = 100),
+                             dict(start = 0, end = 0.58, start_epoch = 10 , end_epoch = 100)],
+
+     }
 
     # config_dict = { 'hidden_dims' : [ [[1500, 1500,1500,1500,1500,1500, 2], [1500,1500,1500,1500, 1500, 1500]], [[750, 750,750,750,750,750, 2], [750,750,750, 750, 750,750]], [[750, 750,750,750,750, 2], [750,750,750, 750, 750]]],
     #                'beta' : [1,1.5],
@@ -832,6 +864,7 @@ if __name__ == "__main__":
         out_dir_x = out_dir_x + '_lr_scheduler'
         params['start_factor'] = 1.0
         params['end_factor'] = 0.1
+        params['start_epoch'] = 1
         params['total_iters'] = 50
     
     if type(params['beta']) == dict:
@@ -840,13 +873,21 @@ if __name__ == "__main__":
 
     if any([all([params['time_features'] is not None, params['append_mode'] != 1]), params['condition_embedding_size'] is not None]):
         if params['condition_embedding_size'] is not None:
-            out_dir_x = out_dir_x + f'_cEBVAE'
+            if params['condition_dependant_latent']:
+                out_dir_x = out_dir_x + f'_cBVAElatentdependant'
+            elif params['full_conditioning']:
+                out_dir_x = out_dir_x + f'_cEFullBVAE_'
+            else:
+                out_dir_x = out_dir_x + f'_cEBVAE'
         else:
+            params["full_conditioning"] = False
             out_dir_x = out_dir_x + f'_cBVAE'
     else:
         out_dir_x = out_dir_x + f'_BVAE'
-    
 
+    if params['prior_flow'] is not None:
+        out_dir_x = out_dir_x + f'_{params["prior_flow"]["type"].__name__}prior'
+    
     if params['non_random_decoder_initialization']:
         out_dir_x = out_dir_x + f'_ValNnRandDecodInit'
 
@@ -856,8 +897,6 @@ if __name__ == "__main__":
     if params['remove_ensemble_mean'] : 
         out_dir_x = out_dir_x + f'_RmEnsMn'
 
-    if params['correction']:
-        out_dir_x = out_dir_x + f'_Correction'
 
     if params['loss_reduction'] == 'sum':
         out_dir_x = out_dir_x + f'_MSESUM'

@@ -79,8 +79,9 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
         start_factor = params['start_factor']
         end_factor = params['end_factor']
         total_iters = params['total_iters']
+        start_epoch = params['start_epoch']
     else:
-        start_factor = end_factor = total_iters = None
+        start_factor = end_factor = total_iters = start_epoch = None
 
     print("Start training")
 
@@ -90,8 +91,6 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
     ###### PG: Add ensemble features to training features
     ensemble_mode = params['ensemble_mode'] ##
 
-    Biome = params['Biome']
-    
     if params["arch"] == 3:
         params["hidden_dims"] = [[1500, 720, 360, 180, 90, 30], [90, 180, 360, 720, 1500]]
     if params['arch'] == 2:
@@ -108,9 +107,10 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
         if params['prior_flow'] is None:
             params['non_random_decoder_initialization'] = True
             print('Warning: non_random_decoder_initialization turned on for condition dependant latent in cVAE to be sampled (flow is off) ...')
+            assert params['loss_reduction'] == 'sum', 'loss_reduction has to be sum for normalized flow priors'
+            
         else:
             assert params['non_random_decoder_initialization'] is False, 'non_random_decoder_initialization should be False for condition dependant flow based prior ...'
-
         
         params['full_conditioning'] = True
         print('Warning: full_conditioning turned True for condition dependant latent in cVAE ...')
@@ -241,16 +241,17 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
             f"L2_reg\t{l2_reg}\n" + 
             f"optimizer\t{optimizer.__name__}\n" +
             f"lr\t{params['lr']}\n" +
-            f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs\n" + 
+            f"lr_scheduler\t{params['lr_scheduler']}: {start_factor} --> {end_factor} in {total_iters} epochs starting {start_epoch}\n" + 
             f"forecast_preprocessing_steps\t{[s[0] if forecast_preprocessing_steps is not None else None for s in forecast_preprocessing_steps]}\n" +
             f"observations_preprocessing_steps\t{[s[0] if observations_preprocessing_steps is not None else None for s in observations_preprocessing_steps]}\n" +
             f"loss_region\t{loss_region}\n" +
             f"subset_dimensions\t{subset_dimensions}\n" + 
             f"lead_time_mask\t{params['lead_time_mask']}\n" + 
             f"condition_embedding_size\t{params['condition_embedding_size']}\n" +
+            f"condition_type\t{params['condition_type']}\n" +
             f"condemb_to_decoder\t{params['condemb_to_decoder']}\n" +
             f"prior_flow\t{params['prior_flow']}\n" +
-            f"fixed_posterior_variance\t{params['fixed_posterior_variance']}\n" + 
+            f"min_posterior_variance\t{params['min_posterior_variance']}\n" + 
             f"cross_member_training\t{params['cross_member_training']}\n" + 
             f"non_random_decoder_initialization\t{params['non_random_decoder_initialization']}\n" + 
             f"loss_reduction\t{params['loss_reduction']}\n" 
@@ -269,12 +270,12 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
             # else:
             #     train_years = ds_raw_ensemble_mean.year[ds_raw_ensemble_mean.year <= test_year].to_numpy()
             n_train = len(train_years)
-            train_mask = create_train_mask(ds_raw_ensemble_mean[:n_train,...])
             # if not params['correction']:
             #     train_mask = np.full(train_mask.shape, False, dtype=bool)
 
-            ds_baseline = ds_raw_ensemble_mean[:n_train,...]
-            obs_baseline = obs_raw[:n_train,...]
+            ds_baseline = ds_raw_ensemble_mean[:n_train,...] 
+            obs_baseline = obs_raw[:n_train,...] 
+            train_mask = create_train_mask(ds_raw_ensemble_mean[:n_train,...])
 
             if 'ensembles' in ds_raw_ensemble_mean.dims: ## PG: Broadcast the mask to the correct shape if you have an ensembles dim.
                 preprocessing_mask_fct = np.broadcast_to(train_mask[...,None,None,None,None], ds_baseline.shape)
@@ -305,9 +306,15 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                 obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
             obs = obs_pipeline.transform(obs_raw)
 
-            if params['remove_ensemble_mean']:
-                ds_em = ds.mean('ensembles')
+            ds_em = ds.mean('ensembles')
+            if params['remove_ensemble_mean']:  
+                if test_year < test_years[-1]:
+                    ds_em_test = ds_em[n_train:n_train + 1,...]      
                 ds = ds - ds_em
+
+            # condition_standardizer = Standardizer()
+            # condition_standardizer = condition_standardizer.fit(ds_em[:n_train,...])
+            # ds_em = condition_standardizer.transform(ds_em)
             
             # if params['correction']:
             year_max = ds[:n_train + 1].year[-1].values 
@@ -330,23 +337,13 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
             #     ds_test = ds[n_train - 1:n_train ,...]
             #     obs_test = obs[n_train -1:n_train ,...]
 
-            if params['remove_ensemble_mean']:
-                ds_em_train = ds_em.sel(year = ds_train.year)
-                if test_year < test_years[-1]:
-                    ds_em_test = ds_em.sel(year = ds_test.year)
-                del ds_em
-
             weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
             weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon}) # Create an DataArray to pass to Spatialnanremove() 
+            weights = xr.ones_like(weights)
             weights_ = weights.copy()
             
-            ### Increase the weight over some biome :
-            if Biome is not None:
-                if type(Biome) == dict:
-                    for ind, scale in Biome.items():
-                          weights = weights + (scale-1) * weights.where(biomes == ind).fillna(0)       
-                    else:
-                          weights = weights + weights.where(biomes == Biome).fillna(0)
+
+
     
             ########################################################################
 
@@ -395,7 +392,7 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
 
             if model == Autoencoder:
                 net = model(img_dim, hidden_dims[0], hidden_dims[1], added_features_dim=add_feature_dim, append_mode=params['append_mode'], batch_normalization=batch_normalization, dropout_rate=dropout_rate, VAE = params['BVAE'], condition_embedding_dims = params['condition_embedding_size'], full_conditioning = params["full_conditioning"] , condition_dependant_latent = params["condition_dependant_latent"], 
-                            fixed_posterior_variance = params['fixed_posterior_variance'], prior_flow = params['prior_flow'], condemb_to_decoder = params['condemb_to_decoder'],  device = device)
+                            min_posterior_variance = params['min_posterior_variance'], prior_flow = params['prior_flow'], condemb_to_decoder = params['condemb_to_decoder'],  device = device)
 
             net.to(device)
             optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay = l2_reg)
@@ -405,20 +402,18 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
             ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
             train_set = XArrayDataset(ds_train, obs_train, mask=train_mask, lead_time = lead_time, extra_predictors= extra_predictors,lead_time_mask = params['lead_time_mask'], in_memory=False, time_features=time_features, aligned = True, year_max = year_max, conditional_embedding = conditional_embedding, cross_member_training = params['cross_member_training']) 
             dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+
             if conditional_embedding:
-                if params['remove_ensemble_mean']:
-                    ds_train_conds = nanremover.sample(ds_em_train).stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()]
-                    del ds_em_train
-                else:
-                    ds_train_conds = ds_train.stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()].mean('ensembles')
+                if params['condition_type'] == 'climatology':
+                    ds_em = xr.concat([ds_em.mean('year').expand_dims('year', axis = 0) for _ in range(len(ds_em.year))], dim = 'year').assign_coords(year = ds_em.year.values)
+
+                ds_train_conds = nanremover.sample(ds_em.sel(year = ds_train.year)).stack(flattened=('year','lead_time')).transpose('flattened',...)[~train_mask.flatten()]
                 if lead_time is not None:
                     ds_train_conds = ds_train_conds.where((ds_train_conds.lead_time >=  (lead_time - 1) * 12 + 1) & (ds_train_conds.lead_time < (lead_time *12 )+1), drop = True)
-
-                condition_standardizer = Standardizer()
-                condition_standardizer.fit(ds_train_conds)
-                ds_train_conds = condition_standardizer.transform(ds_train_conds)
-
                 ds_train_conds = torch.from_numpy(ds_train_conds.to_numpy())
+                if test_year < test_years[-1]:
+                    ds_test_conds = nanremover.sample(ds_em.sel(year = ds_test.year)).stack(flattened=('year','lead_time')).transpose('flattened',...)
+                    ds_test_conds = torch.from_numpy(ds_test_conds.to_numpy())
 
             # if reg_scale is None: ## PG: if no penalizing for negative anomalies
             criterion = WeightedMSESignLossKLD(weights=weights, device=device, hyperparam=hyperparam, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale)
@@ -431,20 +426,37 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
             num_batches = len(dataloader)
             step = 0
             for epoch in tqdm.tqdm(range(epochs)):
+                # if type(params['beta']) == dict:
+                #         if epoch + 1< params['beta']['start_epoch']:
+                #             beta = params['beta']['start']
+                #         else:
+                #             range_epochs = (params['beta']['end_epoch'] - params['beta']['start_epoch'] + 1)
+                #             step_beta = np.clip((epoch - (params['beta']['start_epoch'] - 1)) /(range_epochs),a_min = 0, a_max = None)
+                #             beta = params['beta']['start'] + (params['beta']['end'] - params['beta']['start']) * min(step_beta, 1)
 
+                # else:
+                #         beta = params['beta']
                 #### You can comment this section if you don't want shuffling with each epoch ###
                 if all([params['cross_member_training'], epoch>=1]):
                     train_set = train_set.shuffle_target_ensembles()
                     dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+
                 #############################################################################
                 batch_loss = 0
                 batch_loss_MSE = 0
                 for batch, (x, y) in enumerate(dataloader):
+
                     if type(params['beta']) == dict:
-                        beta = params['beta']['start'] + (params['beta']['end'] - params['beta']['start']) * min(step/(params['beta']['epochs'] * num_batches), 1)
+                        if epoch + 1< params['beta']['start_epoch']:
+                            beta = params['beta']['start']
+                        else:
+                            range_epochs = (params['beta']['end_epoch'] - params['beta']['start_epoch'] + 1)*num_batches
+                            step_beta = np.clip((step - (params['beta']['start_epoch'] - 1)* num_batches) /(range_epochs),a_min = 0, a_max = None)
+                            beta = params['beta']['start'] + (params['beta']['end'] - params['beta']['start']) * min(step_beta, 1)
+
                     else:
                         beta = params['beta']
-                    step =+1
+                    step = step +1
 
                     if conditional_embedding:
                         cond_idx = x[-1]
@@ -490,9 +502,11 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                     optimizer.step()
                 epoch_loss.append(batch_loss / num_batches)
                 epoch_MSE.append(batch_loss_MSE / num_batches)
+                
 
                 if params['lr_scheduler']:
-                    scheduler.step()
+                    if epoch +1 >= start_epoch:
+                        scheduler.step()
             del train_set, dataloader, adjusted_forecast, x, y , m, criterion, loss
             gc.collect()
 
@@ -538,11 +552,10 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                                 test_obs = target.to(device).unsqueeze(0)
                                 m = None
                             if conditional_embedding:
-                                    cond = test_raw[0].mean(axis = -3) if (type(test_raw) == list) or (type(test_raw) == tuple) else test_raw.mean(axis = -3)         
+                                    cond = ds_test_conds[i].type_as(test_obs).to(device)
                             else:
                                     cond = None
                             
-                            cond = (cond - condition_standardizer.mean)/condition_standardizer.std
                             sample_size = test_raw[0].shape[0] if (type(test_raw) == list) or (type(test_raw) == tuple) else test_raw.shape[0]
                             if params['non_random_decoder_initialization'] is False:
                                 z =  Normal(torch.zeros(net.latent_size), torch.ones(( net.latent_size))).rsample(sample_shape=(params['BVAE']* sample_size,)).to(device)
@@ -555,8 +568,9 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                                     
                                 else:
                                     _, mu, log_var = net(test_raw, condition = cond, sample_size = 1)
+                                    samples = net.sample(mu, log_var, 100 )
                                     var = torch.exp(log_var) + 1e-4
-                                    z =  Normal(torch.mean(mu, 0), torch.std(mu, 0)).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
+                                    z =  Normal(torch.mean(samples, (0,1)), torch.std(samples, (0,1))).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
                                     # z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
                                     
                             ### cut from above
@@ -672,7 +686,7 @@ if __name__ == "__main__":
         "extra_predictors" : [],
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'LE',
-        "epochs": 100,
+        "epochs": 40,
         "batch_size": 100,
         "batch_normalization": False,
         "dropout_rate": 0,
@@ -682,37 +696,34 @@ if __name__ == "__main__":
         "reg_scale" : 0,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.0001 ,
+        "lr": 0.00001 ,
         "loss_region": None,
         "subset_dimensions": None,
         "lead_time_mask" : None,
-        'lr_scheduler' : True,
+        'lr_scheduler' : False,
         'BVAE' : 10,
         'training_sample_size' : 1, 
         'non_random_decoder_initialization' : False,
-        'condition_embedding_size' :[1500, 1500,1500,1500,1500,1500,1500, 1500,100],
+        'condition_embedding_size' : [1500, 1500,1500,1500,1500,1500,1500, 1500,2],
+        'condition_type' : 'ensemble_mean', # 'ensemble_mean' or 'climatology'
         'condemb_to_decoder' : True, 
-        'fixed_posterior_variance' : None,#np.array([0.25]),
+        'min_posterior_variance' :  np.array([0.25]),
         'condition_dependant_latent' : False,
-        'prior_flow' :  None,#{'type' : RealNVP, 'num_layers' : 5},
+        'prior_flow' :  None, #{'type' : MAF, 'num_layers' : 5},
         'full_conditioning' : False,
         'cross_member_training' : False,
-        'remove_ensemble_mean' : False,
-        'loss_reduction' : 'mean' , # mean or sum
+        'remove_ensemble_mean' : True,
+        'loss_reduction' : 'sum' , # mean or sum
     }
 
     ### handles
     params['ensemble_list'] = np.arange(1,21)#[f'r{e}i1p2f1' for e in range(1,21,1)] ## PG
  
     params["arch"] = None
-    params['version'] = 1 ### 1 , 2 ,3
-    params['beta'] = 0.5# dict(start = 0, end = 1, epochs = 100)  
+    params['version'] = 0 ### 1 , 2 ,3
+    params['beta'] =  50 #dict(start = 0, end =0.2, start_epoch = 10 , end_epoch = 40)  
     params['reg_scale'] = 0
     
-    biomes = xr.open_dataset('/home/rpg002/fgco2_decadal_forecast_adjustment/Time_Varying_Biomes.nc').MeanBiomes.transpose()
-    params['Biome'] = None
-
-
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/fgco2_ems/SOM-FFN/results/{params["model"].__name__}/run_set_8_toy'
     # out_dir_xx = f'{out_dir_x}/git_data_20230426'
     # out_dir    = f'{out_dir_xx}/SPNA' 
@@ -728,6 +739,7 @@ if __name__ == "__main__":
         out_dir = out_dir + '_lr_scheduler'
         params['start_factor'] = 1.0
         params['end_factor'] = 0.1
+        params['start_epoch'] = 1
         params['total_iters'] = 50
 
     if any([all([params['time_features'] is not None, params['append_mode'] != 1]), params['condition_embedding_size'] is not None]):
@@ -775,13 +787,13 @@ if __name__ == "__main__":
             out_dir = out_dir + f'_fake_data_normal_2pi' 
         elif fake_data == 'pi':
             data_dir_forecast = LOC_FORECASTS_fgco2_pi
-            out_dir = out_dir + f'_fake_data_normal_pi_notencoder' 
+            out_dir = out_dir + f'_fake_data_normal_pi_smallbeta_start10' 
         else:
             data_dir_forecast = LOC_FORECASTS_fgco2_simple
             out_dir = out_dir + f'_fake_data_normal_simple' 
         unit_change = 1
 
-    if params['fixed_posterior_variance'] is not None:
+    if params['min_posterior_variance'] is not None:
         out_dir = out_dir + f'_pR'
         
     out_dir = out_dir + f"_TSE{len(params['ensemble_list'])}" 
