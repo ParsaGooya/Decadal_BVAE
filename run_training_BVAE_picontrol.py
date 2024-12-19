@@ -67,10 +67,11 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
     elif params['version'] == 3:
 
         params['forecast_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0)),
         ('standardize', Standardizer(axis = (0,1,2)))]
-        params['observations_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v2(axis=0))  ]
+        params['forecast_ensemble_mean_preprocessing_steps'] = [
+        ('standardize', Standardizer(axis = (0,1)))]
+        params['observations_preprocessing_steps'] = []
+
 
     else:
         params['forecast_preprocessing_steps'] = []
@@ -108,9 +109,9 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
         if params['prior_flow'] is None:
             params['non_random_decoder_initialization'] = True
             print('Warning: non_random_decoder_initialization turned on for condition dependant latent in cVAE to be sampled (flow is off) ...')
-            assert params['loss_reduction'] == 'sum', 'loss_reduction has to be sum for normalized flow priors'
-            
+                  
         else:
+            assert params['loss_reduction'] == 'sum', 'loss_reduction has to be sum for normalized flow priors'
             assert params['non_random_decoder_initialization'] is False, 'non_random_decoder_initialization should be False for condition dependant flow based prior ...'
         
         params['full_conditioning'] = True
@@ -712,7 +713,7 @@ if __name__ == "__main__":
 
     params = {
         "model": Autoencoder,
-        "hidden_dims": [[3000, 3000,1500,1500, 500], [ 1500,1500,3000, 3000]],
+        "hidden_dims": [[3000, 3000, 1500, 1500, 100], [1500, 1500, 3000, 3000]],
         "time_features": None, #['sin_t', 'cos_t'],
         "extra_predictors" : [],
         'ensemble_list' : None, ## PG
@@ -734,25 +735,25 @@ if __name__ == "__main__":
         'lr_scheduler' : True,
         'BVAE' : 50,
         'training_sample_size' : 100, 
-        'non_random_decoder_initialization' : True,
-        'condition_embedding_size' : None , #[1500, 1500,1500,1500,1500,1500,10],
+        'non_random_decoder_initialization' : False,
+        'condition_embedding_size' : [3000, 3000, 1500, 1500, 100], #[3000, 3000, 1500, 1500, 100] , #[1500, 1500,1500,1500,1500,1500,10],
         'condition_type' : 'climatology', # 'ensemble_mean' or 'climatology'
         'condemb_to_decoder' : False, 
         'min_posterior_variance' :  None, #np.array([0.25]),
-        'condition_dependant_latent' : False,
+        'condition_dependant_latent' : True,
         'prior_flow' :  None, #{'type' : MAF, 'num_layers' : 5},
         'full_conditioning' : False,
         'cross_member_training' : False,
         'remove_ensemble_mean' : False,
-        'loss_reduction' : 'sum' , # mean or sum
+        'loss_reduction' : 'mean' , # mean or sum
     }
 
     ### handles
     params['ensemble_list'] = [ 4, 7, 11, 12, 20] #np.arange(1,21)#[f'r{e}i1p2f1' for e in range(1,21,1)] ## PG
  
     params["arch"] = None
-    params['version'] = 2 ### 1 , 2 ,3
-    params['beta'] =  0.01# dict(start = 0, end =1, start_epoch = 1 , end_epoch = 50)  
+    params['version'] = 3 ### 1 , 2 ,3
+    params['beta'] =   dict(start = 0, end =0.5, start_epoch = 1 , end_epoch = 100)  
     params['reg_scale'] = 0
     
     out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/{var}/SOM-FFN/results/{params["model"].__name__}/run_set_1_picontrol'

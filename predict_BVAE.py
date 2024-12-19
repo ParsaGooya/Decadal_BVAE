@@ -90,7 +90,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
     if 'latentdependant' in  results_dir:
         params['condition_dependant_latent'] = True
         assert params['condition_embedding_size'] is not None
-        assert params['non_random_decoder_initialization'] not in ['histogram_based_sampling', 'normal_train_based_std']
+        assert params['non_random_decoder_initialization'] not in ['histogram_based_sampling', 'normal_based_train_sampling']
         params['full_conditioning'] = True
         if params['prior_flow'] is not None:
             assert params['non_random_decoder_initialization'] is False, 'non_random_decoder_initialization should be False for condition dependant flow based prior ...'
@@ -119,8 +119,8 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
         assert params['ensemble_list'] is not None, 'for the BVAE model you need to specify the ensemble size ...'
     
     if not params['non_random_decoder_initialization']:
-       if not params['remove_ensemble_mean']:
-            assert any([all([params['time_features'] is not None, params['append_mode'] != 1]), params['condition_embedding_size'] is not None]), 'For random decoder initializaiton, conditions should be provided to the decoder ...' 
+       if all([params['remove_ensemble_mean'] is False, any([params['time_features'] is None, params['append_mode'] != 3]),params['condition_embedding_size'] is None]):
+            print('!!!! Warning: random decoder initializaiton is True without any conditions provided to the decoder !!!!!!' )
     
 
     if params["model"] not in [Autoencoder, Autoencoder_decoupled]:
@@ -350,6 +350,8 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
 
         weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
         weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon}) # Create an DataArray to pass to Spatialnanremove() 
+        if 'equalweights' in results_dir:
+            weights = xr.ones_like(weights)
         weights_ = weights.copy()
         
         ### Increase the weight over some biome :
@@ -419,7 +421,7 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
 
         net.to(device)
         ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
-        if any([params['non_random_decoder_initialization'] in ['histogram_based_sampling','normal_train_based_std'], truncated]):
+        if any([params['non_random_decoder_initialization'] in ['histogram_based_sampling','normal_based_train_sampling'], truncated]):
             train_set = XArrayDataset(ds_train, obs_train, mask=train_mask, lead_time = lead_time, extra_predictors= extra_predictors,lead_time_mask = params['lead_time_mask'], in_memory=False, time_features=time_features, aligned = True, year_max = year_max, conditional_embedding = conditional_embedding, cross_member_training = params['cross_member_training']) 
         # dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
         if conditional_embedding:
@@ -509,13 +511,13 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
         test_results = np.zeros_like(xr.concat([ds_test for _ in range(params['BVAE'])], dim = 'ensembles').values)
         ds_test = ds_test.rename({'ensembles' : 'batch'})
 
-        if any([params['non_random_decoder_initialization'] in ['histogram_based_sampling','normal_train_based_std'],truncated]):
+        if any([params['non_random_decoder_initialization'] in ['histogram_based_sampling','normal_based_train_sampling'],truncated]):
             x_in = torch.from_numpy(train_set.data.to_numpy()).float().to(device)
             if conditional_embedding:
                 cond = ds_train_conds[train_set.condition_target_ids].float().to(device)
             else:
                 cond = None
-            if all([params['time_features'] is not None, params['append_mode'] != 1]):
+            if all([params['time_features'] is not None, params['append_mode'] != 2]):
                 x_in = (x_in , torch.from_numpy(train_set.time_features).float().to(device))
             with torch.no_grad():
                 mu, log_var = net(x_in, condition = cond, sample_size = 1)[1:3]
@@ -533,8 +535,9 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
                 # truncated_min = train_samples.min(axis = 0)
                 # truncated_max = train_samples.max(axis = 0)
 
-            if params['non_random_decoder_initialization'] == 'normal_train_based_std':
-                sample_stds = np.array([np.std(train_samples[:,i]) for i in range(net.latent_size)])
+            if params['non_random_decoder_initialization'] == 'normal_based_train_sampling':
+                means = np.mean(train_samples, axis=0)
+                covs = np.cov(train_samples, rowvar=False)
 
             elif  params['non_random_decoder_initialization'] ==   'histogram_based_sampling':    
                 hist, edges = np.histogramdd(train_samples, bins=25 * net.latent_size ) 
@@ -576,24 +579,24 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
                         if params['condition_dependant_latent']:
                                 _, _, _, cond_mu, cond_log_var = net(test_raw, condition = cond, sample_size = 1)
                                 cond_var = torch.exp(cond_log_var) + 1e-4
-                                z =  Normal(cond_mu.squeeze(), torch.sqrt(cond_var).squeeze()).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
+                                z =  Normal(cond_mu.squeeze(), torch.sqrt(cond_var).squeeze() * torch.tensor(np.array(num_stds))).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
  
-                        if params['non_random_decoder_initialization'] == 'encoder_based_sampling':
+                        elif params['non_random_decoder_initialization'] == 'encoder_based_sampling':
                             _, mu, log_var = net(test_raw, condition = cond, sample_size = 1)[:3]
                             samples = net.sample(mu, log_var, 100 )
                             var = torch.exp(log_var) + 1e-4
-                            z =  Normal(torch.mean(samples, (0,1)), torch.std(samples, (0,1))).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
+                            z =  Normal(torch.mean(samples, (0,1)), torch.std(samples, (0,1)) * torch.tensor(np.array(num_stds)) ).rsample(sample_shape=(params['BVAE'] * sample_size,)).to(device)
                             
                         elif params['non_random_decoder_initialization'] == 'histogram_based_sampling':
                             z = hist_sampling(hist, edges, net.latent_size , num_samples = params['BVAE'] * sample_size)
                             z = torch.from_numpy(z).float().to(device)
 
-                        elif params['non_random_decoder_initialization'] == 'normal_train_based_std':
-                                stds =  num_stds * torch.ones(( net.latent_size)) * sample_stds
+                        elif params['non_random_decoder_initialization'] == 'normal_based_train_sampling':
                                 # z =  Normal(torch.zeros(net.latent_size), stds ).rsample(sample_shape=(params['BVAE']* sample_size,)).to(device)
-                                z = torch_normal_sampling(torch.zeros(net.latent_size), stds, num_samples=  params['BVAE']* sample_size, 
-                                                          truncated_dist = truncated_dist ).to(device)
-                        else:
+                                z = torch_normal_sampling(torch.tensor(means, dtype=torch.float32), torch.tensor(covs, dtype=torch.float32), num_samples=  params['BVAE']* sample_size, 
+                                                          truncated_dist = truncated_dist, multivariate=True ).to(device)
+                                z = torch.tensor(means, dtype=torch.float32).to(device) + (z - torch.tensor(means, dtype=torch.float32).to(device)) * torch.tensor(np.array(num_stds), dtype=torch.float32).to(device) ## sample from a wider standard deviation
+                        else:   
                             raise RuntimeError("Specify the sampling strategy fopr the prior is not condition dependent. Hint: adjust params['non_random_decoder_initialization']")
 
                         # z = torch.unflatten(z, dim = 0, sizes = (-1,len(ensemble_list)))
@@ -670,10 +673,10 @@ def predict(params, test_years, lead_years,model_year = None,  results_dir=None,
         out_name = f'tests/nn_adjusted_{test_year}_saved_model_'
 
         if params['non_random_decoder_initialization'] is not False:
-            if params['non_random_decoder_initialization'] == 'normal_train_based_std':
-                out_name = out_name + f'normal_train_based_{num_stds}stds'
+            if params['non_random_decoder_initialization'] == 'histogram_based_sampling':
+                out_name = out_name + f'{params["non_random_decoder_initialization"]}'   
             else:
-                out_name = out_name + f'{params["non_random_decoder_initialization"]}'
+                out_name = out_name + f'{params["non_random_decoder_initialization"]}_{num_stds}stds'
         else:
             out_name = out_name + f'{num_stds}stds'
 
@@ -710,7 +713,10 @@ def torch_normal_sampling( mu, std, num_samples = 1, truncated_dist = None,  ):
     if truncated_dist is not None:
         samples = []
         while len(samples) < num_samples:
-            sample =  Normal(mu, std).rsample(sample_shape=(num_samples,))
+            if multivariate:
+                sample =  MultivariateNormal(mu, covariance_matrix=std).rsample(sample_shape=(num_samples,))
+            else:
+                sample =  Normal(mu, std).rsample(sample_shape=(num_samples,))
             # Keep only samples within the bounds
  
             if isinstance(truncated_dist, np.ndarray):
@@ -723,7 +729,10 @@ def torch_normal_sampling( mu, std, num_samples = 1, truncated_dist = None,  ):
         # Concatenate all valid samples and return the required number
         return torch.cat(samples)[:num_samples]
     else:
-        z =  Normal(mu, std).rsample(sample_shape=(num_samples,))
+        if multivariate:
+                z =  MultivariateNormal(mu, covariance_matrix=std).rsample(sample_shape=(num_samples,))
+        else:
+                z =  Normal(mu, std).rsample(sample_shape=(num_samples,))
         return z
 
 def extract_params(model_dir):
