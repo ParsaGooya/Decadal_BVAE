@@ -19,7 +19,7 @@ from preprocessing import align_data_and_targets, get_coordinate_indices, create
 from preprocessing import AnomaliesScaler_v1, AnomaliesScaler_v2, Standardizer, PreprocessingPipeline, Spatialnanremove, calculate_climatology
 from torch_datasets import XArrayDataset
 from subregions import subregions
-from data_locations import LOC_FORECASTS_fgco2_2pi, LOC_FORECASTS_fgco2_pi, LOC_OBSERVATIONS_fgco2_v2023, LOC_FORECASTS_fgco2_simple, LOC_FORECASTS_fgco2
+from data_locations import LOC_FORECASTS_fgco2_2pi, LOC_FORECASTS_fgco2_pi, LOC_OBSERVATIONS_fgco2_v2023, LOC_FORECASTS_fgco2
 import gc
 # specify data directories
 data_dir_forecast = LOC_FORECASTS_fgco2
@@ -53,27 +53,24 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
 
         params['forecast_preprocessing_steps'] = [
         ('standardize', Standardizer())]
+        params['forecast_ensemble_mean_preprocessing_steps'] = [
+        ('standardize', Standardizer())]
         params['observations_preprocessing_steps'] = []
+
 
     elif params['version'] == 2:
 
-        params['forecast_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v2(axis=0)),
-        ('standardize', Standardizer(axis = (0,1,2)))]
-        params['observations_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v2(axis=0))  ]
+        params['forecast_preprocessing_steps'] = []
+        params['forecast_ensemble_mean_preprocessing_steps'] = []
+        params['observations_preprocessing_steps'] = []
+        params['remove_ensemble_mean'] = True
 
-    elif params['version'] == 3:
-
-        params['forecast_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v1(axis=0)),
-        ('standardize', Standardizer(axis = (0,1,2)))]
-        params['observations_preprocessing_steps'] = [
-        ('anomalies', AnomaliesScaler_v2(axis=0))  ]
 
     else:
-        params['forecast_preprocessing_steps'] = []
+        params['forecast_preprocessing_steps'] = [  ('standardize', Standardizer(axis = (0,1,2)))]
         params['observations_preprocessing_steps'] = []
+        params['forecast_ensemble_mean_preprocessing_steps'] = []
+
     
     if params['lr_scheduler']:
         start_factor = params['start_factor']
@@ -107,9 +104,9 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
         if params['prior_flow'] is None:
             params['non_random_decoder_initialization'] = True
             print('Warning: non_random_decoder_initialization turned on for condition dependant latent in cVAE to be sampled (flow is off) ...')
-            assert params['loss_reduction'] == 'sum', 'loss_reduction has to be sum for normalized flow priors'
-            
+                  
         else:
+            assert params['loss_reduction'] == 'sum', 'loss_reduction has to be sum for normalized flow priors'
             assert params['non_random_decoder_initialization'] is False, 'non_random_decoder_initialization should be False for condition dependant flow based prior ...'
         
         params['full_conditioning'] = True
@@ -210,6 +207,7 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
     l2_reg = params["L2_reg"]
     
     forecast_preprocessing_steps = params["forecast_preprocessing_steps"]
+    forecast_ensemble_mean_preprocessing_steps = params["forecast_ensemble_mean_preprocessing_steps"]
     observations_preprocessing_steps = params["observations_preprocessing_steps"]
 
     loss_region = params["loss_region"]
@@ -272,10 +270,10 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
             n_train = len(train_years)
             # if not params['correction']:
             #     train_mask = np.full(train_mask.shape, False, dtype=bool)
-
-            ds_baseline = ds_raw_ensemble_mean[:n_train,...] 
-            obs_baseline = obs_raw[:n_train,...] 
-            train_mask = create_train_mask(ds_raw_ensemble_mean[:n_train,...])
+            
+            ds_baseline = ds_raw_ensemble_mean[:n_train,...]  
+            obs_baseline = obs_raw[:n_train,...]  
+            train_mask = create_train_mask(ds_raw_ensemble_mean[:n_train,...]) 
 
             if 'ensembles' in ds_raw_ensemble_mean.dims: ## PG: Broadcast the mask to the correct shape if you have an ensembles dim.
                 preprocessing_mask_fct = np.broadcast_to(train_mask[...,None,None,None,None], ds_baseline.shape)
@@ -297,31 +295,59 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                 # torch.backends.cudnn.benchmark = False
                 # torch.cuda.manual_seed_all(torch_seed)
             # Data preprocessing
-            
-            ds_pipeline = PreprocessingPipeline(forecast_preprocessing_steps).fit(ds_baseline, mask=preprocessing_mask_fct)
-            ds = ds_pipeline.transform(ds_raw_ensemble_mean)
+            ######################### original ###############################  
+            # ds_pipeline = PreprocessingPipeline(forecast_preprocessing_steps).fit(ds_baseline, mask=preprocessing_mask_fct)
+            # ds = ds_pipeline.transform(ds_raw_ensemble_mean)
 
-            obs_pipeline = PreprocessingPipeline(observations_preprocessing_steps).fit(obs_baseline, mask=preprocessing_mask_obs)
-            if 'standardize' in ds_pipeline.steps:
-                obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
-            obs = obs_pipeline.transform(obs_raw)
+            # obs_pipeline = PreprocessingPipeline(observations_preprocessing_steps).fit(obs_baseline, mask=preprocessing_mask_obs)
+            # if 'standardize' in ds_pipeline.steps:
+            #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
+            # obs = obs_pipeline.transform(obs_raw)
 
-            ds_em = ds.mean('ensembles')
-            if params['remove_ensemble_mean']:  
-                if test_year < test_years[-1]:
-                    ds_em_test = ds_em[n_train:n_train + 1,...]      
-                ds = ds - ds_em
+            # ds_em = ds.mean('ensembles')
+            # if params['remove_ensemble_mean']:  
+                # if test_year < test_years[-1]:
+                    # ds_em_test = ds_em[n_train:n_train + 1,...]      
+                # ds = ds - ds_em
 
             # condition_standardizer = Standardizer()
             # condition_standardizer = condition_standardizer.fit(ds_em[:n_train,...])
             # ds_em = condition_standardizer.transform(ds_em)
-            
+            ###################################################################################
+            ######################### new ###############################            
+
+            ds_em_before = ds_raw_ensemble_mean.mean('ensembles')
+            if params['remove_ensemble_mean']:  
+                ds_before = ds_raw_ensemble_mean - ds_em_before
+                if params['version'] == 2:
+                    ds_em_std = ds_raw_ensemble_mean.std('ensembles')
+                    ds_before = ds_before/ds_em_std
+
+                if test_year < test_years[-1]:
+                    ds_em_test = ds_em_before[n_train:n_train + 1,...]  
+                    if params['version'] == 2:
+                        ds_std_test =  ds_em_std[n_train:n_train + 1,...] 
+                        del  ds_em_std
+            else:
+                ds_before =  ds_raw_ensemble_mean.copy()
+
+            ds_pipeline = PreprocessingPipeline(forecast_preprocessing_steps).fit(ds_before[:n_train,...], mask=preprocessing_mask_fct)
+            ds = ds_pipeline.transform(ds_before)
+ 
+            ds_em_pipeline = PreprocessingPipeline(forecast_ensemble_mean_preprocessing_steps).fit(ds_em_before[:n_train,...], mask=preprocessing_mask_obs) 
+            ds_em = ds_em_pipeline.transform(ds_em_before)
+
+            obs_pipeline = PreprocessingPipeline(observations_preprocessing_steps).fit(obs_baseline, mask=preprocessing_mask_obs) 
+            # if 'standardize' in ds_pipeline.steps:
+            #     obs_pipeline.add_fitted_preprocessor(ds_pipeline.get_preprocessors('standardize'), 'standardize')
+            obs = obs_pipeline.transform(obs_raw)
+            ####################################################################################
             # if params['correction']:
             year_max = ds[:n_train + 1].year[-1].values 
             # else:
             # year_max = ds[:n_train].year[-1].values 
 
-            del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct
+            del ds_baseline, obs_baseline, preprocessing_mask_obs, preprocessing_mask_fct, ds_before,ds_em_before
             gc.collect()
             # TRAIN MODEL
             ####### time inclusion
@@ -339,7 +365,7 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
 
             weights = np.cos(np.ones_like(ds_train.lon) * (np.deg2rad(ds_train.lat.to_numpy()))[..., None])  # Moved this up
             weights = xr.DataArray(weights, dims = ds_train.dims[-2:], name = 'weights').assign_coords({'lat': ds_train.lat, 'lon' : ds_train.lon}) # Create an DataArray to pass to Spatialnanremove() 
-            weights = xr.ones_like(weights)
+            # weights = xr.ones_like(weights)
             weights_ = weights.copy()
             
 
@@ -400,6 +426,7 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                 scheduler = lr_scheduler.LinearLR(optimizer, start_factor=params['start_factor'], end_factor=params['end_factor'], total_iters=params['total_iters'])
 
             ## PG: XArrayDataset now needs to know if we are adding ensemble features. The outputs are datasets that are maps or flattened in space depending on the model.
+
             train_set = XArrayDataset(ds_train, obs_train, mask=train_mask, lead_time = lead_time, extra_predictors= extra_predictors,lead_time_mask = params['lead_time_mask'], in_memory=False, time_features=time_features, aligned = True, year_max = year_max, conditional_embedding = conditional_embedding, cross_member_training = params['cross_member_training']) 
             dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
 
@@ -629,12 +656,22 @@ def run_training(params, n_years, lead_years, lead_time = None, n_runs=1, result
                     result = xr.DataArray(test_results_untransformed, ds_test.coords, ds_test.dims, name='nn_adjusted')
                 else:  
                     test_results_upsampled = nanremover.to_map(test_results)  ## PG: If the output is spatially flat, write back to maps
-                    if params['remove_ensemble_mean']:
-                        test_results_upsampled = test_results_upsampled + ds_em_test
-                        del ds_em_test
+                    ###################### original #################
+                    # if params['remove_ensemble_mean']:
+                    #     test_results_upsampled = test_results_upsampled + ds_em_test
+                    #     del ds_em_test
+                    #################################################
                     test_results_untransformed = reverse_preprocessing_pipeline.inverse_transform(test_results_upsampled.values) ## PG: Check preprocessing.AnomaliesScaler for changes
                     result = xr.DataArray(test_results_untransformed, test_results_upsampled.coords, test_results_upsampled.dims, name='nn_adjusted')
-                
+                    ####################### new ######################
+                    if params['remove_ensemble_mean']:
+                        if params['version'] == 2:
+                            result = result * ds_std_test
+                            del ds_std_test
+                        result = result + ds_em_test.to_dataset(name='nn_adjusted')
+                        del ds_em_test
+                    #################################################
+                    
                 ##################################################################################################################################
                 # Store results as NetCDF            
                 result.to_netcdf(path=Path(results_dir, f'nn_adjusted_{test_year}_{run+1}.nc', mode='w'))
@@ -686,7 +723,7 @@ if __name__ == "__main__":
         "extra_predictors" : [],
         'ensemble_list' : None, ## PG
         'ensemble_mode' : 'LE',
-        "epochs": 40,
+        "epochs": 100,
         "batch_size": 100,
         "batch_normalization": False,
         "dropout_rate": 0,
@@ -696,18 +733,18 @@ if __name__ == "__main__":
         "reg_scale" : 0,
         "beta" : 1,
         "optimizer": torch.optim.Adam,
-        "lr": 0.00001 ,
+        "lr": 0.0001 ,
         "loss_region": None,
         "subset_dimensions": None,
         "lead_time_mask" : None,
         'lr_scheduler' : False,
         'BVAE' : 10,
         'training_sample_size' : 1, 
-        'non_random_decoder_initialization' : False,
-        'condition_embedding_size' : [1500, 1500,1500,1500,1500,1500,1500, 1500,2],
+        'non_random_decoder_initialization' : True,
+        'condition_embedding_size' : None, #[1500, 1500,1500,1500,1500,1500,1500, 1500,2],
         'condition_type' : 'ensemble_mean', # 'ensemble_mean' or 'climatology'
-        'condemb_to_decoder' : True, 
-        'min_posterior_variance' :  np.array([0.25]),
+        'condemb_to_decoder' : False, 
+        'min_posterior_variance' :  None,#np.array([0.25]),
         'condition_dependant_latent' : False,
         'prior_flow' :  None, #{'type' : MAF, 'num_layers' : 5},
         'full_conditioning' : False,
@@ -720,11 +757,11 @@ if __name__ == "__main__":
     params['ensemble_list'] = np.arange(1,21)#[f'r{e}i1p2f1' for e in range(1,21,1)] ## PG
  
     params["arch"] = None
-    params['version'] = 0 ### 1 , 2 ,3
-    params['beta'] =  50 #dict(start = 0, end =0.2, start_epoch = 10 , end_epoch = 40)  
+    params['version'] = 2 ### 0, 1 , 2 ,3
+    params['beta'] =  1 #dict(start = 0, end =0.5, start_epoch = 10 , end_epoch = 11)  
     params['reg_scale'] = 0
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/fgco2_ems/SOM-FFN/results/{params["model"].__name__}/run_set_8_toy'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/fgco2_ems/SOM-FFN/results/{params["model"].__name__}/run_set_10_toy'
     # out_dir_xx = f'{out_dir_x}/git_data_20230426'
     # out_dir    = f'{out_dir_xx}/SPNA' 
     if type(params['beta']) == dict:
@@ -787,10 +824,7 @@ if __name__ == "__main__":
             out_dir = out_dir + f'_fake_data_normal_2pi' 
         elif fake_data == 'pi':
             data_dir_forecast = LOC_FORECASTS_fgco2_pi
-            out_dir = out_dir + f'_fake_data_normal_pi_smallbeta_start10' 
-        else:
-            data_dir_forecast = LOC_FORECASTS_fgco2_simple
-            out_dir = out_dir + f'_fake_data_normal_simple' 
+            out_dir = out_dir + f'_fake_data_normal_pi_weightedMSE' 
         unit_change = 1
 
     if params['min_posterior_variance'] is not None:

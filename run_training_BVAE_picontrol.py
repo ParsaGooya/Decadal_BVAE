@@ -13,7 +13,7 @@ from torch.optim import lr_scheduler
 from models.autoencoder import Autoencoder, MAF, RealNVP
 from models.cnn import CNN
 from models.unet import UNet
-from losses import WeightedMSE, WeightedMSESignLoss, WeightedMSESignLossKLD
+from losses import WeightedMSE, WeightedMSESignLoss, WeightedMSESignLossKLD, Frobenius_norm
 from data_utils.datahandling import combine_observations
 from preprocessing import align_data_and_targets, get_coordinate_indices, create_train_mask, reshape_obs_to_data
 from preprocessing import AnomaliesScaler_v1, AnomaliesScaler_v2, Standardizer, PreprocessingPipeline, Spatialnanremove, calculate_climatology
@@ -442,11 +442,14 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
 
             # if reg_scale is None: ## PG: if no penalizing for negative anomalies
             criterion = WeightedMSESignLossKLD(weights=weights, device=device, hyperparam=hyperparam, reduction=params['loss_reduction'], loss_area=loss_region_indices, scale=reg_scale)
+            if params['Frobenius_norm_weight'] is not None:
+                Frobenius_loss = Frobenius_norm( img_dim = img_dim , weight = params['Frobenius_norm_weight'])
             # else:
             #         criterion = WeightedMSESignLossKLD(weights=weights, device=device, hyperparam=hyperparam, reduction='mean', loss_area=loss_region_indices, scale=reg_scale, min_val=0, max_val=None)
             # criterion = VAEloss(weights = weights , device = device)
             epoch_loss = []
             epoch_MSE = []
+            epoch_FLD = []
             net.train()
             num_batches = len(dataloader)
             step = 0
@@ -469,6 +472,7 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
                 #############################################################################
                 batch_loss = 0
                 batch_loss_MSE = 0
+                batch_loss_FLD = 0
                 for batch, (x, y) in enumerate(dataloader):
 
                     if type(params['beta']) == dict:
@@ -519,7 +523,10 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
                     # else:
                     #     ## first generate mu and sigma then sample from z
                     #     pass
-                    
+                    if params['Frobenius_norm_weight'] is not None:
+                        FL = Frobenius_loss(adjusted_forecast.mean(0), y)
+                        loss = loss + FL
+                        batch_loss_FLD += FL.item()
 
                     batch_loss += loss.item()
                     batch_loss_MSE += MSE.item()
@@ -527,6 +534,7 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
                     optimizer.step()
                 epoch_loss.append(batch_loss / num_batches)
                 epoch_MSE.append(batch_loss_MSE / num_batches)
+                epoch_FLD.append(batch_loss_FLD / num_batches)
                 
 
                 if params['lr_scheduler']:
@@ -673,9 +681,11 @@ def run_training(params,var, n_years, lead_years, lead_time = None, n_runs=1, re
                 del   test_results, test_results_untransformed
                 gc.collect()
                 fig, ax = plt.subplots(1,1, figsize=(8,5))
-                ax.plot(np.arange(1,epochs+1), epoch_loss)
-                ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed')
+                ax.plot(np.arange(1,epochs+1), epoch_loss, label = 'Epoch loss')
+                ax.plot(np.arange(1,epochs+1), epoch_MSE, linestyle = 'dashed', label = 'Epoch MSE')
                 ax.set_title(f'Train Loss \n test loss: {np.mean(test_loss)}') ###
+                if params['Frobenius_norm_weight'] is not None:
+                    ax.plot(np.arange(1,epochs+1), epoch_FLD, linestyle = 'dotted', alpha = 0.5, label = 'Epoch FLD')
                 ax.legend()
                 ax.set_xlabel('Epoch')
                 ax.set_ylabel('Loss')
@@ -713,7 +723,7 @@ if __name__ == "__main__":
 
     params = {
         "model": Autoencoder,
-        "hidden_dims": [[3000, 3000, 1500, 1500, 100], [1500, 1500, 3000, 3000]],
+        "hidden_dims": [[3000, 3000, 3000, 3000, 500], [3000, 3000, 3000, 3000]],
         "time_features": None, #['sin_t', 'cos_t'],
         "extra_predictors" : [],
         'ensemble_list' : None, ## PG
@@ -736,27 +746,28 @@ if __name__ == "__main__":
         'BVAE' : 50,
         'training_sample_size' : 100, 
         'non_random_decoder_initialization' : False,
-        'condition_embedding_size' : [3000, 3000, 1500, 1500, 100], #[3000, 3000, 1500, 1500, 100] , #[1500, 1500,1500,1500,1500,1500,10],
+        'condition_embedding_size' : None, #[3000, 3000, 3000, 3000, 5], #[3000, 3000, 1500, 1500, 100] , #[1500, 1500,1500,1500,1500,1500,10],
         'condition_type' : 'climatology', # 'ensemble_mean' or 'climatology'
         'condemb_to_decoder' : False, 
         'min_posterior_variance' :  None, #np.array([0.25]),
-        'condition_dependant_latent' : True,
+        'condition_dependant_latent' : False,
         'prior_flow' :  None, #{'type' : MAF, 'num_layers' : 5},
         'full_conditioning' : False,
         'cross_member_training' : False,
         'remove_ensemble_mean' : False,
         'loss_reduction' : 'mean' , # mean or sum
+        'Frobenius_norm_weight' : None,
     }
 
     ### handles
     params['ensemble_list'] = [ 4, 7, 11, 12, 20] #np.arange(1,21)#[f'r{e}i1p2f1' for e in range(1,21,1)] ## PG
  
     params["arch"] = None
-    params['version'] = 3 ### 1 , 2 ,3
-    params['beta'] =   dict(start = 0, end =0.5, start_epoch = 1 , end_epoch = 100)  
+    params['version'] = 2 ### 1 , 2 ,3
+    params['beta'] =   dict(start = 0, end =0.75, start_epoch = 1 , end_epoch = params['epochs'])  
     params['reg_scale'] = 0
     
-    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/{var}/SOM-FFN/results/{params["model"].__name__}/run_set_1_picontrol'
+    out_dir_x  = f'/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/output/{var}/SOM-FFN/results/{params["model"].__name__}/run_set_2_picontrol'
     # out_dir_xx = f'{out_dir_x}/git_data_20230426'
     # out_dir    = f'{out_dir_xx}/SPNA' 
     if type(params['beta']) == dict:
@@ -772,7 +783,7 @@ if __name__ == "__main__":
         params['start_factor'] = 1.0
         params['end_factor'] = 0.1
         params['start_epoch'] = 1
-        params['total_iters'] = 50
+        params['total_iters'] = params['epochs']
 
     if any([all([params['time_features'] is not None, params['append_mode'] != 1]), params['condition_embedding_size'] is not None]):
         
@@ -816,8 +827,15 @@ if __name__ == "__main__":
 
     if params['min_posterior_variance'] is not None:
         out_dir = out_dir + f'_pR'
+
+    if params['Frobenius_norm_weight'] is not None:
+        out_dir = out_dir + f"_CC{params['Frobenius_norm_weight']}"
         
-    out_dir = out_dir + f"_TSE{len(params['ensemble_list'])}_LS{params['hidden_dims'][0][-1]}" 
+    out_dir = out_dir + f"_TSE{len(params['ensemble_list'])}_LS{params['hidden_dims'][0][-1]}_beta0.75" 
+
+    if params['condition_embedding_size'] is not None:
+        out_dir = out_dir + f'_condembsize{params["condition_embedding_size"][-1]}'
+
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Figures').mkdir(parents=True, exist_ok=True)
     Path(out_dir + '/Saved_models').mkdir(parents=True, exist_ok=True)

@@ -102,7 +102,7 @@ ds_fake = xr.open_dataset('/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/dat
 
 LOC_FORECASTS_fgco2 = '/space/hall5/sitestore/eccc/crd/ccrn/users/rpg002/data/fgco2/simulation'
 latent_dim = 2
-num_samples = 1000
+num_samples = 5000
 freq_coeffs = ds_fake.attrs['time_scales']
 harmonic_wavenumbers = ds_fake.attrs['Spherical_harmonic_wavenumbers']
 harmonic_m = ds_fake.attrs['Spherical_harmonic_order'] 
@@ -111,8 +111,8 @@ print(f'Spherical harmonic wavenumbers {harmonic_wavenumbers} deg')
 print(f'Spherical harmonic order m {harmonic_m}')
 
 ds_in = xr.open_mfdataset(str(Path(LOC_FORECASTS_fgco2, "*.nc")), combine='nested', concat_dim='year').mean('ensembles').load()['fgco2'].sel(year = slice(1950,None))
-time = np.arange(len(ds_in.year) * 12)[-120:]
-years = ds_in.year.values[-10:]
+time = np.arange(len(ds_in.year) * 12)[-60:]
+years = ds_in.year.values[-5:]
 del ds_in, ds_fake
 
 ls = []
@@ -127,4 +127,4 @@ fake_ds.attrs['Spherical_harmonic_wavenumbers'] =  harmonic_wavenumbers
 fake_ds.attrs['Spherical_harmonic_spatial_scale'] =  2 * np.pi * R_earth_km / harmonic_wavenumbers 
 fake_ds.attrs['Spherical_harmonic_order'] = harmonic_m
 fake_ds.attrs['units'] = 'month, deg, km'
-fake_ds.assign_coords(ensembles = np.arange(num_samples)).to_netcdf(LOC_FORECASTS_fgco2 + '/fake_test/fake_historical_ensembles_2005-2014_1x1_LE_pi.nc')
+fake_ds.assign_coords(ensembles = np.arange(num_samples)).to_netcdf(LOC_FORECASTS_fgco2 + '/fake_test/fake_historical_ensembles_2010-2014_1x1_LE_pi.nc')

@@ -185,6 +185,27 @@ class WeightedMSESignLossKLD:  ## PG: penalizing negative anomalies
             return loss, MSE, KL
         else:
             return loss
+        
+class Frobenius_norm:
+    def __init__(self, img_dim: tuple , weight = 1):
+
+        self.img_dim = img_dim
+        self.weight = weight
+
+    def __call__(self, data, target, print_loss = True):
+        y = data.view(-1, self.img_dim)
+        try:
+            y_true = target.view(-1, self.img_dim)
+        except:
+            y_true = target.reshape(-1, self.img_dim)
+        covariance_truth = torch.cov(y_true.T)  # Transpose for covariance computation
+        covariance_prediction = torch.cov(y.T)
+        frobenius_norm =  torch.linalg.matrix_norm(covariance_prediction - covariance_truth)
+        if print_loss:
+            print(f'FLN : {frobenius_norm/self.img_dim}')
+
+        return (frobenius_norm * self.weight)/self.img_dim
+
     
 def sample(  mu, std, sample_size = 1, device = 'cpu'):
         N = torch.distributions.Normal(0, 1)

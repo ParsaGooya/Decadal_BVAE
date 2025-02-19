@@ -549,8 +549,10 @@ class Standardizer:
         return data_standardized
 
     def inverse_transform(self, data: np.ndarray):
-
-        transpose_ =  (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))
+        if self.axis is None:
+            transpose_ =  np.arange(len(data.shape))
+        else:
+            transpose_ =  (*self.axis, *np.delete(np.arange(len(data.shape)), self.axis))
         data_transposed = data.transpose(*transpose_)
         data_raw = data_transposed * self.std + self.mean
 
