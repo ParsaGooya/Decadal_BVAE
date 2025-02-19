@@ -8,7 +8,7 @@ This repository contains scripts for designing, running, and tuning hyperparamet
 Please ignore `models.unet` and `models.cnn`, as these are older versions that are no longer updated.
 
 ## Contributors
-This work was developed by **Parsa Gooya** in collaboration with **Reinel Sospedra-Alfonso** and **Johannes Exenberger**.
+This work was developed by **Parsa Gooya** in collaboration with **Reinel Sospedra-Alfonso** and **Johannes Exenberger** at the **Canadian Centre for Climate Modeling and Analysis (CCCma)**.
 
 ## Copyright
 © Environment and Climate Change Canada and the contributors, 2025. All rights reserved.  
